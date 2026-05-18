@@ -4,6 +4,21 @@ import {ContractErrors, processSimulationErrors} from './errors.js'
 
 export {ContractErrors}
 
+/** Trading order type - instructions to contract how to execute the trade */
+export const OrderKind = {
+    /** Execute trade, create a limit order if not executed in full */
+    Limit: 1,
+    /** Execute trade without creating a limit order */
+    Fill: 2,
+    /** Execute trade, cancel if was not executed in full */
+    FillOrKill: 3
+}
+
+const TradeDirection = {
+    Sell: 1,
+    Buy: 2
+}
+
 /**
  * Smart contract client for trading with AXIS DEX
  */
@@ -22,28 +37,6 @@ export class AxisContractClient {
         }
         this.client = new ContractClient(options)
         this.fee = params.fee || '100000'
-    }
-
-    /**
-     * Trade with orders
-     * @param {TradeArguments} params - Fill orders parameters
-     * @return {Promise<[i128, i128]>} - Amount of sold and bought tokens
-     * @throws {Error} - If any of the orders provided do not match selling/buying asset
-     * @throws {Error} - If the trade causes an overflow
-     */
-    async fill(params) {
-        const payload = {
-            trader: params.trader,
-            amount: params.amount,
-            selling: params.selling,
-            buying: params.buying,
-            max_price: params.price,
-            orders: params.orders
-        }
-        const tx = await this.client.fill(payload, {fee: this.fee})
-        processSimulationErrors(tx)
-        const res = await tx.signAndSend()
-        return [res.result.sold, res.result.bought]
     }
 
     /**
@@ -68,13 +61,13 @@ export class AxisContractClient {
 
     /**
      * Cancel existing order
-     * @param {u64} id - ID of the order to cancel
+     * @param {u64[]} ids - ID of the order to cancel
      * @param {string} trader - Trader address
      * @return {Promise<void>}
      * @throws {Error} - If trader is not the owner of the order
      */
-    async cancel(id, trader) {
-        const tx = await this.client.cancel({id, trader}, {fee: this.fee})
+    async cancel(ids, trader) {
+        const tx = await this.client.cancel({ids, trader}, {fee: this.fee})
         processSimulationErrors(tx)
         await tx.signAndSend()
     }
@@ -97,28 +90,45 @@ export class AxisContractClient {
     }
 
     /**
-     * Trade with DEX and create sell limit order if quote not executed in full
-     * @param {TradeArguments} params
+     * Trade with DEX and create buy limit order if quote not executed in full
+     * @param {BuyTradeArguments} params
      * @return {Promise<[i128, i128, u64]>} - Amount of sold and bought tokens, ID of the newly created order if any
      * @throws {Error} - If the trader has insufficient balance
      * @throws {Error} - If any of the orders provided do not match selling/buying asset
      * @throws {Error} - If the trade causes an overflow
      */
-    async sell_limit(params) {
-        const payload = {
-            trader: params.trader,
-            amount: params.amount,
-            selling: params.selling,
-            buying: params.buying,
-            price: params.price,
-            ttl: params.ttl,
-            orders: params.orders
-        }
-        const tx = await this.client.fill_order(payload, {fee: this.fee})
-        processSimulationErrors(tx)
-        const {result} = await tx.signAndSend()
-        return [result[0], result[1], result[2]]
+    async buy(params) {
+        return await execTrade(params, TradeDirection.Buy, this)
     }
+
+    /**
+     * Trade with DEX and create sell limit order if quote not executed in full
+     * @param {SellTradeArguments} params
+     * @return {Promise<[i128, i128, u64]>} - Amount of sold and bought tokens, ID of the newly created order if any
+     * @throws {Error} - If the trader has insufficient balance
+     * @throws {Error} - If any of the orders provided do not match selling/buying asset
+     * @throws {Error} - If the trade causes an overflow
+     */
+    async sell(params) {
+        return await execTrade(params, TradeDirection.Sell, this)
+    }
+}
+
+async function execTrade(params, direction, context) {
+    const payload = {
+        direction: direction,
+        kind: params.kind,
+        trader: params.trader,
+        amount: params.amount,
+        selling: params.selling,
+        buying: params.buying,
+        price: params.price,
+        orders: params.orders
+    }
+    const tx = await context.client.trade(payload, {fee: context.fee})
+    processSimulationErrors(tx)
+    const {result} = await tx.signAndSend()
+    return [result[0], result[1], result[2]]
 }
 
 /**
@@ -139,13 +149,27 @@ export class AxisContractClient {
 
 /**
  * @typedef {{}} TradeArguments
+ * @property {OrderKind} kind - Trading order behavior
  * @property {string} trader - Trader address
- * @property {i128} amount - Amount of tokens to sell
+ * @property {i128} amount - Tokens amount
  * @property {string} selling - Selling token address
  * @property {string} buying - Buying token address
  * @property {i128} price - Price a trader willing to accept
- * @property {u64} ttl - Time to live for an order (expired orders will be automatically purged)
  * @property {Array<u64>} orders - List of order IDs to match before creating the order on-chain
+ */
+
+/**
+ * @typedef {{}} SellTradeArguments
+ * @extends TradeArguments
+ * @property {i128} amount - Amount of `selling` tokens to sell
+ * @property {i128} price - Price a trader willing to accept, minimum `buying` tokens per 1 `selling`
+ */
+
+/**
+ * @typedef {{}} BuyTradeArguments
+ * @extends TradeArguments
+ * @property {i128} amount - Amount of `buying` tokens to acquire
+ * @property {i128} price - Price a trader willing to accept, maximum `selling` tokens per 1 `buying`
  */
 
 /**
@@ -156,8 +180,8 @@ export class AxisContractClient {
 /**
  * @typedef {{}} Order
  * @property {u64} id - Order ID
+ * @property {OrderKind} kind - Trading behavior
  * @property {string} owner - Owner of the order
- * @property {OrderType} kind - Order type
  * @property {string} selling - Selling token address
  * @property {string} buying - Buying token address
  * @property {i128} amount - Amount of tokens to sell

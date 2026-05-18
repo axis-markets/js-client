@@ -1,20 +1,16 @@
 import type {u64, i128} from "@stellar/stellar-sdk/contract";
 
 export interface Order {
-    amount: i128;
-    buying: string;
-    expires: u64;
     id: u64;
-    kind: OrderType;
+    kind: OrderKind;
+    selling: string;
+    buying: string;
+    amount: i128;
+    quote: i128;
     owner: string;
     price: i128;
-    quote: i128;
-    selling: string;
+    expires: u64;
 }
-
-export type OrderType = { tag: "Limit", values: void };
-
-export type TradeDirection = { tag: "Buy", values: void } | { tag: "Sell", values: void };
 
 export interface Trade {
     bought: i128;
@@ -23,6 +19,12 @@ export interface Trade {
     order: u64;
     sold: i128;
     taker: string;
+}
+
+export enum OrderKind {
+    Limit = 1,
+    Fill = 2,
+    FillOrKill = 3,
 }
 
 export declare const ContractErrors: {
@@ -55,9 +57,11 @@ export type SignTransactionCallback = (
 ) => Promise<{signedTxXdr: string; signerAddress?: string}>;
 
 export interface TradeArguments {
+    /** Trading order behavior */
+    kind: OrderKind,
     /** Trader address */
     trader: string;
-    /** Amount of tokens to sell */
+    /** Tokens amount */
     amount: i128;
     /** Selling token address */
     selling: string;
@@ -65,21 +69,26 @@ export interface TradeArguments {
     buying: string;
     /** Price a trader willing to accept */
     price: i128;
-    /** Time to live for an order (expired orders will be automatically purged) */
-    ttl: u64;
     /** List of order IDs to match before creating the order on-chain */
     orders: Array<u64>;
 }
 
+export interface SellTradeArguments extends TradeArguments {
+    /** Amount of `selling` tokens to sell */
+    amount: i128;
+    /** Price a trader willing to accept, minimum `buying` tokens per 1 `selling` */
+    price: i128;
+}
+
+export interface BuyTradeArguments extends TradeArguments {
+    /** Amount of `buying` tokens to acquire */
+    amount: i128;
+    /** Price a trader willing to accept, maximum `selling` tokens per 1 `buying` */
+    price: i128;
+}
+
 export declare class AxisContractClient {
     constructor(params: ClientInitializationParams);
-
-    /**
-     * Trade with orders
-     * @param params - Fill orders parameters
-     * @returns Amount of sold and bought tokens
-     */
-    fill(params: TradeArguments): Promise<[i128, i128]>;
 
     /**
      * Retrieve last order id
@@ -96,10 +105,10 @@ export declare class AxisContractClient {
 
     /**
      * Cancel existing order
-     * @param id - ID of the order to cancel
+     * @param ids - ID of the order to cancel
      * @param trader - Trader address
      */
-    cancel(id: u64, trader: string): Promise<void>;
+    cancel(ids: Array<u64>, trader: string): Promise<void>;
 
     /**
      * Fill existing orders using another matching order from the orderbook
@@ -111,9 +120,16 @@ export declare class AxisContractClient {
     fill_order(trader: string, takerOrderId: u64, orders: Array<u64>): Promise<[i128, i128]>;
 
     /**
+     * Trade with DEX and create buy limit order if quote not executed in full
+     * @param params - Trade parameters
+     * @returns Amount of sold tokens, bought tokens, and ID of the newly created order if any
+     */
+    buy(params: BuyTradeArguments): Promise<[i128, i128, u64]>;
+
+    /**
      * Trade with DEX and create sell limit order if quote not executed in full
      * @param params - Trade parameters
      * @returns Amount of sold tokens, bought tokens, and ID of the newly created order if any
      */
-    sell_limit(params: TradeArguments): Promise<[i128, i128, u64]>;
+    sell(params: SellTradeArguments): Promise<[i128, i128, u64]>;
 }
