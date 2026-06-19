@@ -1,37 +1,35 @@
 {
-  "name": "@axis-markets/contract-client",
-  "version": "0.2.0",
-  "private": true,
-  "description": "AXIS smart contract client",
-  "author": "info@stellar.expert",
+  "name": "@axis-markets/client",
+  "version": "0.3.0",
+  "description": "AXIS contract and API client",
+  "author": "team@stellar.expert",
   "license": "MIT",
   "type": "module",
   "types": "lib/index.d.ts",
   "main": "lib/axisContractClient.js",
   "module": "src/index.js",
-  "homepage": "https://github.com/reflector-network/dao-client",
-  "scripts": {
-    "prepare": "webpack --mode=production --config webpack.config.cjs",
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
+  "homepage": "https://axis.markets",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/axis-markets/contract-client.git"
+    "url": "git+https://github.com/axis-markets/js-client.git"
   },
-  "bugs": "https://github.com/axis-markets/contract-client/issues",
+  "bugs": "https://github.com/axis-markets/js-client/issues",
+  "scripts": {
+    "prepare": "webpack --mode=production --config webpack.config.cjs"
+  },
   "peerDependencies": {
-    "@stellar/stellar-sdk": ">=14",
-    "@stellar/stellar-base": ">=14"
+    "@stellar/stellar-sdk": ">=15"
   },
   "devDependencies": {
-    "@babel/core": "^7.26.7",
-    "@babel/preset-env": "^7.26.7",
-    "babel-loader": "^9.2.1",
-    "babel-jest": "^29.7.0",
-    "jest": "^29.7.0",
-    "typescript": "^5.7.3",
-    "webpack": "^5.97.1",
-    "webpack-cli": "^5.1.4",
-    "ws": "^8.17.1"
-  }
+    "@babel/core": "^8.0.1",
+    "@babel/preset-env": "^8.0.2",
+    "babel-loader": "10.1.1",
+    "babel-jest": "^30.4.1",
+    "jest": "^30.4.2",
+    "webpack": "^5.107.2",
+    "webpack-cli": "^7.0.3"
+  },
+  "files": [
+    "src/"
+  ]
 }

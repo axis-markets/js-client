@@ -29,8 +29,7 @@ module.exports = function () {
             ]
         },
         externals: {
-            '@stellar/stellar-sdk': '@stellar/stellar-sdk',
-            '@stellar/stellar-base': '@stellar/stellar-base'
+            '@stellar/stellar-sdk': '@stellar/stellar-sdk'
         },
         plugins: [
             new webpack.DefinePlugin({
