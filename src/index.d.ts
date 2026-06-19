@@ -257,3 +257,328 @@ export declare class AxisContractClient {
      */
     swap(params: SwapArguments): Promise<[bigint, bigint]>;
 }
+
+/**
+ * Error thrown when the Aggregator API responds with a non-success HTTP status
+ */
+export declare class AxisApiError extends Error {
+    constructor(message: string, status: number);
+
+    /** HTTP status code associated with the error */
+    readonly status: number;
+}
+
+export interface QuoteParams {
+    /** Asset to sell (`XLM` | `CODE:Issuer` | `CODE-Issuer` | contractId) */
+    sellingAsset: string;
+    /** Asset to buy (same format as `sellingAsset`) */
+    buyingAsset: string;
+    /** Trade amount in stroops (1 unit = 10,000,000 stroops) */
+    amount: string | number;
+    /** Restrict to the direct market only (no intermediate-asset routes) */
+    direct?: boolean;
+}
+
+export interface QuotePathStep {
+    /** Selling asset contract id at this hop */
+    selling: string;
+    /** Buying asset contract id at this hop */
+    buying: string;
+    /** Maker order IDs matched at this hop */
+    orders: string[];
+}
+
+export interface QuotePath {
+    /** Amount sold, in stroops */
+    sold: string;
+    /** Amount bought, in stroops */
+    bought: string;
+    /** Ordered list of hops in the route */
+    path: QuotePathStep[];
+}
+
+export interface QuoteResult {
+    /** Base58-encoded quote id */
+    id: string;
+    /** Quote status */
+    status: 'success' | 'unfeasible' | 'rejected';
+    /** Trade direction */
+    direction: 'strict_send' | 'strict_receive';
+    /** Selling asset contract id */
+    sellingAsset: string;
+    /** Buying asset contract id */
+    buyingAsset: string;
+    /** Ledger sequence the quote was computed for */
+    ledger: number;
+    /** Candidate routes ranked by profitability (up to 10) */
+    paths: QuotePath[];
+    /** Error message (present only if status is not `success`) */
+    error?: string;
+}
+
+export interface DepthParams {
+    /** Market identifier `BASE/QUOTE` */
+    market: string;
+    /** Percentage band (±) around the center price (0 < depth ≤ 100, default 20) */
+    depth?: number;
+}
+
+export interface OrderbookDepth {
+    /** Ledger sequence */
+    ledger: number;
+    /** UNIX timestamp (seconds) */
+    timestamp: number;
+    /** `[price, quantity]` pairs sorted descending by price */
+    bids: Array<[string, string]>;
+    /** `[price, quantity]` pairs sorted ascending by price */
+    asks: Array<[string, string]>;
+}
+
+export interface CandlesParams {
+    /** Market identifier `BASE/QUOTE` */
+    market: string;
+    /** Lower boundary (UNIX seconds, default 0) */
+    from?: number;
+    /** Upper boundary (UNIX seconds, defaults to `from + resolution * 200`) */
+    to?: number;
+    /** Resolution in seconds or alias (`5m`,`15m`,`30m`,`1h`,`2h`,`4h`,`12h`,`1d`,`3d`,`1w`,`2w`, default `auto`) */
+    resolution?: number | string;
+    /** Sort order (default `desc`) */
+    order?: 'asc' | 'desc';
+}
+
+/**
+ * OHLCVT candle row: `[timestamp, open, high, low, close, baseVolume, quoteVolume, tradeCount]`
+ */
+export type Candle = [number, string, string, string, string, string, string, number];
+
+export interface TickerEntry {
+    /** Market symbol `BASE/QUOTE` */
+    symbol: string;
+    /** Opening price 24h ago */
+    openPrice: string;
+    /** Highest price in the 24h window */
+    highPrice: string;
+    /** Lowest price in the 24h window */
+    lowPrice: string;
+    /** Most recent trade price */
+    lastPrice: string;
+    /** 24h base asset volume */
+    volume: string;
+    /** 24h quote asset volume */
+    quoteVolume: string;
+    /** 24h price change (percent) */
+    change: number;
+    /** Volume-weighted average price */
+    avgPrice: string;
+    /** 24h trade count */
+    trades: number;
+}
+
+export interface Ticker24hResult {
+    /** Ledger sequence */
+    ledger: number;
+    /** UNIX timestamp (seconds) */
+    timestamp: number;
+    /** Per-market 24h stats, sorted by trade count descending */
+    ticker: TickerEntry[];
+}
+
+export interface MarketsParams {
+    /** Pagination cursor (`baseAsset-quoteAsset`) */
+    cursor?: string;
+    /** Max markets to return */
+    limit?: number | string;
+}
+
+export interface MarketInfo {
+    /** Base asset contract id */
+    baseAsset: string;
+    /** Quote asset contract id */
+    quoteAsset: string;
+    /** Pagination cursor for this market */
+    cursor: string;
+    /** Supported order types */
+    orderTypes: string[];
+}
+
+export interface OrdersParams {
+    /** Filter by order owner address */
+    owner?: string;
+    /** Filter by asset(s) - matches orders selling or buying any of them */
+    asset?: string | string[];
+    /** Pagination cursor (order id) */
+    cursor?: string | bigint;
+    /** Max orders to return */
+    limit?: number | string;
+}
+
+export interface OrderHistoryParams {
+    /** Filter by order owner address */
+    owner?: string;
+    /** Asset pair `[base, quote]` (contract ids) */
+    pair?: string[];
+    /** Pagination cursor (order id) */
+    cursor?: string | bigint;
+    /** Max orders to return */
+    limit?: number | string;
+}
+
+export interface TradesParams {
+    /** Filter by trader address */
+    trader?: string;
+    /** Asset pair `[base, quote]` (contract ids) */
+    pair?: string[];
+    /** Pagination cursor (trade id) */
+    cursor?: string | bigint;
+    /** Max trades to return */
+    limit?: number | string;
+}
+
+/**
+ * Serialized order returned by the API
+ */
+export interface ApiOrder {
+    /** Order ID */
+    id: string;
+    /** Order status (`ACTIVE`|`FILLED`|`CANCELED`) */
+    status: string;
+    /** Order kind (`LIMIT`) */
+    kind: string;
+    /** Buying asset contract id */
+    buying: string;
+    /** Selling asset contract id */
+    selling: string;
+    /** Order price */
+    price: string;
+    /** Rational price representation */
+    rprice: string;
+    /** Total quote amount */
+    quote: string;
+    /** Amount left to sell/buy */
+    amount: string;
+    /** Maker address */
+    owner: string;
+    /** Expiration timestamp (UTC) */
+    expires?: string;
+    /** Iceberg amount */
+    iceberg?: string;
+    /** Stop price */
+    stop?: string;
+    /** Creation timestamp (UTC) */
+    created?: string;
+    /** Last update timestamp (UTC) */
+    updated?: string;
+    /** Pagination cursor */
+    cursor?: string;
+}
+
+/**
+ * Serialized trade returned by the API
+ */
+export interface ApiTrade {
+    /** Trade ID */
+    id: string;
+    /** Matched order ID */
+    order: string;
+    /** Taker account address */
+    taker: string;
+    /** Maker account address */
+    maker: string;
+    /** Sold asset contract id */
+    soldAsset: string;
+    /** Bought asset contract id */
+    boughtAsset: string;
+    /** Sold tokens amount */
+    sold: string;
+    /** Bought tokens amount */
+    bought: string;
+    /** Approximate trade price */
+    price: string;
+    /** Pagination cursor */
+    cursor?: string;
+    /** Trade timestamp (UTC) */
+    timestamp: string;
+}
+
+/**
+ * HTTP client for the AXIS Aggregator REST API
+ */
+export declare class ApiClient {
+    /**
+     * @param serverUrl - Base URL of the Aggregator server
+     */
+    constructor(serverUrl: string);
+
+    /** Base URL of the Aggregator server */
+    readonly serverUrl: string;
+
+    /**
+     * Price quote and candidate trade routes for selling a fixed amount of the source asset
+     * @param params - Quote request parameters
+     * @returns Best routes ranked by profitability
+     */
+    quoteSell(params: QuoteParams): Promise<QuoteResult>;
+
+    /**
+     * Price quote and candidate trade routes for buying a fixed amount of the destination asset
+     * @param params - Quote request parameters
+     * @returns Best routes ranked by profitability
+     */
+    quoteBuy(params: QuoteParams): Promise<QuoteResult>;
+
+    /**
+     * Order book depth aggregated into price buckets around the mid price
+     * @param params - Depth request parameters
+     * @returns Aggregated bids and asks
+     */
+    getDepth(params: DepthParams): Promise<OrderbookDepth>;
+
+    /**
+     * OHLCVT candlestick data (open, high, low, close, base volume, quote volume, trade count)
+     * @param params - Candles request parameters
+     * @returns Time-bucketed candles, max 200 per response
+     */
+    getCandles(params: CandlesParams): Promise<Candle[]>;
+
+    /**
+     * 24-hour ticker statistics for every available market
+     * @returns Aggregated 24h stats per market
+     */
+    getTicker24h(): Promise<Ticker24hResult>;
+
+    /**
+     * List all active markets with pagination
+     * @param params - Pagination parameters
+     * @returns Active markets
+     */
+    getMarkets(params?: MarketsParams): Promise<MarketInfo[]>;
+
+    /**
+     * Retrieve active orders, filterable by owner or asset
+     * @param params - Filter parameters
+     * @returns Active orders matching the filter
+     */
+    getOrders(params?: OrdersParams): Promise<ApiOrder[]>;
+
+    /**
+     * Retrieve a single order by ID
+     * @param id - Order ID
+     * @returns Order, or null if not found
+     */
+    getOrder(id: bigint | string | number): Promise<ApiOrder | null>;
+
+    /**
+     * Retrieve archived/historical orders
+     * @param params - Filter parameters
+     * @returns Archived orders matching the filter
+     */
+    getOrderHistory(params?: OrderHistoryParams): Promise<ApiOrder[]>;
+
+    /**
+     * Retrieve recent trades
+     * @param params - Filter parameters
+     * @returns Recent trades matching the filter
+     */
+    getTrades(params?: TradesParams): Promise<ApiTrade[]>;
+}

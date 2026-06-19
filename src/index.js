@@ -1,8 +1,9 @@
 import {Networks} from '@stellar/stellar-sdk'
 import ContractClient from './contract-client.js'
 import {ContractErrors, processSimulationErrors} from './errors.js'
+import {ApiClient, AxisApiError} from './api-client.js'
 
-export {ContractErrors}
+export {ContractErrors, ApiClient, AxisApiError}
 
 /** Trading order type - instructions to contract how to execute the trade */
 export const OrderKind = {
