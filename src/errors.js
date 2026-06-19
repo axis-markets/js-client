@@ -1,5 +1,5 @@
 /**
- * Contract-specific error codes
+ * Standard contract errors
  */
 export const ContractErrors = {
     701: {message: "NotAuthorized"},

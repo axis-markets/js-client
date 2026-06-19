@@ -1,32 +1,134 @@
-import type {u64, i128} from "@stellar/stellar-sdk/contract";
-
-export interface Order {
-    id: u64;
-    kind: OrderKind;
-    selling: string;
-    buying: string;
-    amount: i128;
-    quote: i128;
-    owner: string;
-    price: i128;
-    expires: u64;
-}
-
-export interface Trade {
-    bought: i128;
-    id: u64;
-    maker: string;
-    order: u64;
-    sold: i128;
-    taker: string;
-}
-
+/**
+ * Trading order type - instructions to contract how to execute the trade
+ */
 export enum OrderKind {
     Limit = 1,
     Fill = 2,
     FillOrKill = 3,
 }
+/**
+ * Trade direction instructions
+ */
+export enum TradeDirection {
+    Sell = 1,
+    Buy = 2,
+}
 
+/**
+ * Order properties, stored on-chain
+ */
+export interface Order {
+    /**
+     * Amount left to sell/buy
+     */
+    amount: bigint;
+    /**
+     * Buying token address
+     */
+    buying: string;
+    /**
+     * expiration timestamp
+     */
+    expires: bigint;
+    /**
+     * Unique order identifier
+     */
+    id: bigint;
+    /**
+     * Order type
+     */
+    kind: OrderKind;
+    /**
+     * Maker address
+     */
+    owner: string;
+    /**
+     * Order price
+     */
+    price: bigint;
+    /**
+     * Initial selling/buying amount
+     */
+    quote: bigint;
+    /**
+     * Selling token address
+     */
+    selling: string;
+}
+
+/**
+ * Orderbook trade event
+ */
+export interface Trade {
+    /**
+     * Bought tokens amount
+     */
+    bought: bigint;
+    /**
+     * Bought asset address
+     */
+    buying: string;
+    /**
+     * Unique trade id
+     */
+    id: bigint;
+    /**
+     * Seller account address
+     */
+    maker: string;
+    /**
+     * Order id
+     */
+    order: bigint;
+    /**
+     * Sold asset address
+     */
+    selling: string;
+    /**
+     * Sold tokens amount
+     */
+    sold: bigint;
+    /**
+     * Trader account address
+     */
+    taker: string;
+}
+
+/**
+ * A trade step in a multi-market swap path.
+ */
+export interface TradeStep {
+    /**
+     * Asset to buy at this step
+     */
+    asset: string;
+    /**
+     * Maker order IDs to match
+     */
+    orders: Array<bigint>;
+}
+
+/**
+ * Orderbook swap event
+ */
+export interface Swap {
+    /**
+     * Amount of `buying` tokens received
+     */
+    bought: bigint;
+    /**
+     * Amount of `selling` tokens sold
+     */
+    sold: bigint;
+    /**
+     * Trader account address
+     */
+    trader: string;
+}
+
+/**
+ * Standard contract errors
+ */
 export declare const ContractErrors: {
     701: {message: "NotAuthorized"};
     702: {message: "InsufficientBalance"};
@@ -43,7 +145,7 @@ export interface ClientInitializationParams {
     signTransaction: SignTransactionCallback;
     /** URL of the RPC server */
     rpcUrl: string;
-    /** Stellar contract ID */
+    /** DEX contract ID */
     contractId: string;
     /** Network passphrase (Pubnet passphrase by default) */
     networkPassphrase?: string;
@@ -62,29 +164,44 @@ export interface TradeArguments {
     /** Trader address */
     trader: string;
     /** Tokens amount */
-    amount: i128;
+    amount: bigint;
     /** Selling token address */
     selling: string;
     /** Buying token address */
     buying: string;
     /** Price a trader willing to accept */
-    price: i128;
+    price: bigint;
     /** List of order IDs to match before creating the order on-chain */
-    orders: Array<u64>;
+    orders: Array<bigint>;
 }
 
 export interface SellTradeArguments extends TradeArguments {
     /** Amount of `selling` tokens to sell */
-    amount: i128;
+    amount: bigint;
     /** Price a trader willing to accept, minimum `buying` tokens per 1 `selling` */
-    price: i128;
+    price: bigint;
 }
 
 export interface BuyTradeArguments extends TradeArguments {
     /** Amount of `buying` tokens to acquire */
-    amount: i128;
+    amount: bigint;
     /** Price a trader willing to accept, maximum `selling` tokens per 1 `buying` */
-    price: i128;
+    price: bigint;
+}
+
+export interface SwapArguments {
+    /** Trade direction: `Sell` or `Buy` */
+    direction: TradeDirection,
+    /** Trader address */
+    trader: string,
+    /** Token address sent by the trader */
+    selling: string,
+    /** Maximum amount of selling tokens to send */
+    sellingAmount: bigint,
+    /** Minimum amount of buying tokens to receive */
+    buyingAmount: bigint,
+    /** Ordered list of the trade route steps */
+    path: Array<TradeStep>
 }
 
 export declare class AxisContractClient {
@@ -94,21 +211,21 @@ export declare class AxisContractClient {
      * Retrieve last order id
      * @returns Last created order id
      */
-    last(): Promise<u64>;
+    last(): Promise<bigint>;
 
     /**
      * Fetch existing order
      * @param id - ID of the order to fetch
      * @returns Order fetched from the storage
      */
-    order(id: u64): Promise<Order>;
+    order(id: bigint): Promise<Order>;
 
     /**
      * Cancel existing order
      * @param ids - ID of the order to cancel
      * @param trader - Trader address
      */
-    cancel(ids: Array<u64>, trader: string): Promise<void>;
+    cancel(ids: Array<bigint>, trader: string): Promise<void>;
 
     /**
      * Fill existing orders using another matching order from the orderbook
@@ -117,19 +234,26 @@ export declare class AxisContractClient {
      * @param orders - List of order IDs to match
      * @returns Amount of sold and bought tokens
      */
-    fill_order(trader: string, takerOrderId: u64, orders: Array<u64>): Promise<[i128, i128]>;
+    fill_order(trader: string, takerOrderId: bigint, orders: Array<bigint>): Promise<[bigint, bigint]>;
 
     /**
      * Trade with DEX and create buy limit order if quote not executed in full
      * @param params - Trade parameters
      * @returns Amount of sold tokens, bought tokens, and ID of the newly created order if any
      */
-    buy(params: BuyTradeArguments): Promise<[i128, i128, u64]>;
+    buy(params: BuyTradeArguments): Promise<[bigint, bigint, bigint]>;
 
     /**
      * Trade with DEX and create sell limit order if quote not executed in full
      * @param params - Trade parameters
      * @returns Amount of sold tokens, bought tokens, and ID of the newly created order if any
      */
-    sell(params: SellTradeArguments): Promise<[i128, i128, u64]>;
+    sell(params: SellTradeArguments): Promise<[bigint, bigint, bigint]>;
+
+    /**
+     * Swap tokens across several markets.
+     * @param params - Trade parameters
+     * @returns Amount of sold tokens and bought tokens
+     */
+    swap(params: SwapArguments): Promise<[bigint, bigint]>;
 }
