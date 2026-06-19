@@ -1,134 +1,93 @@
-/**
- * Trading order type - instructions to contract how to execute the trade
- */
+/** Trading order type - instructions to contract how to execute the trade */
 export enum OrderKind {
     Limit = 1,
     Fill = 2,
     FillOrKill = 3,
 }
-/**
- * Trade direction instructions
- */
+
+/** Trade direction instructions */
 export enum TradeDirection {
     Sell = 1,
     Buy = 2,
 }
 
-/**
- * Order properties, stored on-chain
- */
+/** Order properties, stored on-chain */
 export interface Order {
-    /**
-     * Amount left to sell/buy
-     */
+    /** Amount left to sell/buy */
     amount: bigint;
-    /**
-     * Buying token address
-     */
+    /** Buying token address */
     buying: string;
-    /**
-     * expiration timestamp
-     */
+    /** expiration timestamp */
     expires: bigint;
-    /**
-     * Unique order identifier
-     */
+    /** Unique order identifier */
     id: bigint;
-    /**
-     * Order type
-     */
+    /** Order type */
     kind: OrderKind;
-    /**
-     * Maker address
-     */
+    /** Maker address */
     owner: string;
-    /**
-     * Order price
-     */
+    /** Order price */
     price: bigint;
-    /**
-     * Initial selling/buying amount
-     */
+    /** Initial selling/buying amount */
     quote: bigint;
-    /**
-     * Selling token address
-     */
+    /** Selling token address */
     selling: string;
 }
 
-/**
- * Orderbook trade event
- */
-export interface Trade {
-    /**
-     * Bought tokens amount
-     */
+/** Orderbook trade event */
+export interface TradeContractEvent {
+    /** Bought tokens amount */
     bought: bigint;
-    /**
-     * Bought asset address
-     */
+    /** Bought asset address */
     buying: string;
-    /**
-     * Unique trade id
-     */
+    /** Unique trade id */
     id: bigint;
-    /**
-     * Seller account address
-     */
+    /** Seller account address */
     maker: string;
-    /**
-     * Order id
-     */
+    /** Order id */
     order: bigint;
-    /**
-     * Sold asset address
-     */
+    /** Sold asset address */
     selling: string;
-    /**
-     * Sold tokens amount
-     */
+    /** Sold tokens amount */
     sold: bigint;
-    /**
-     * Trader account address
-     */
+    /** Trader account address */
     taker: string;
 }
 
-/**
- * A trade step in a multi-market swap path.
- */
+/** Orderbook swap event */
+export interface SwapContractEvent {
+    /** Unique swap id (last trade id assigned while settling the swap legs) */
+    id: bigint;
+    /** Trader account address */
+    trader: string;
+    /** Sold asset address */
+    selling: string;
+    /** Bought asset address */
+    buying: string;
+    /** Amount of `selling` tokens sold */
+    sold: bigint;
+    /** Amount of `buying` tokens received */
+    bought: bigint;
+}
+
+/** A trade step in a multi-market swap path. */
 export interface TradeStep {
-    /**
-     * Asset to buy at this step
-     */
+    /** Asset to buy at this step */
     asset: string;
-    /**
-     * Maker order IDs to match
-     */
+    /** Maker order IDs to match */
     orders: Array<bigint>;
 }
 
-/**
- * Orderbook swap event
- */
+/** Orderbook swap event */
 export interface Swap {
-    /**
-     * Amount of `buying` tokens received
-     */
+    /** Amount of `buying` tokens received */
     bought: bigint;
-    /**
-     * Amount of `selling` tokens sold
-     */
+    /** Amount of `selling` tokens sold */
     sold: bigint;
-    /**
-     * Trader account address
-     */
+    /** Trader account address */
     trader: string;
 }
 
-/**
- * Standard contract errors
- */
+/** Standard contract errors */
 export declare const ContractErrors: {
     701: {message: "NotAuthorized"};
     702: {message: "InsufficientBalance"};
@@ -258,9 +217,7 @@ export declare class AxisContractClient {
     swap(params: SwapArguments): Promise<[bigint, bigint]>;
 }
 
-/**
- * Error thrown when the Aggregator API responds with a non-success HTTP status
- */
+/** Error thrown when the Aggregator API responds with a non-success HTTP status */
 export declare class AxisApiError extends Error {
     constructor(message: string, status: number);
 
@@ -347,9 +304,7 @@ export interface CandlesParams {
     order?: 'asc' | 'desc';
 }
 
-/**
- * OHLCVT candle row: `[timestamp, open, high, low, close, baseVolume, quoteVolume, tradeCount]`
- */
+/** OHLCVT candle row: `[timestamp, open, high, low, close, baseVolume, quoteVolume, tradeCount]` */
 export type Candle = [number, string, string, string, string, string, string, number];
 
 export interface TickerEntry {
@@ -435,9 +390,7 @@ export interface TradesParams {
     limit?: number | string;
 }
 
-/**
- * Serialized order returned by the API
- */
+/** Serialized order returned by the API */
 export interface ApiOrder {
     /** Order ID */
     id: string;
@@ -473,9 +426,7 @@ export interface ApiOrder {
     cursor?: string;
 }
 
-/**
- * Serialized trade returned by the API
- */
+/** Serialized trade returned by the API */
 export interface ApiTrade {
     /** Trade ID */
     id: string;
@@ -501,13 +452,9 @@ export interface ApiTrade {
     timestamp: string;
 }
 
-/**
- * HTTP client for the AXIS Aggregator REST API
- */
+/** HTTP client for the AXIS Aggregator REST API */
 export declare class ApiClient {
-    /**
-     * @param serverUrl - Base URL of the Aggregator server
-     */
+    /** @param serverUrl - Base URL of the Aggregator server */
     constructor(serverUrl: string);
 
     /** Base URL of the Aggregator server */

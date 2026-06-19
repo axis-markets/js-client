@@ -223,3 +223,24 @@ async function execTrade(params, direction, context) {
  * @property {bigint} expires - Expiration time of the order
  */
 
+/**
+* @typedef {object} TradeContractEvent - Orderbook trade event
+* @property {bigint} bought - Bought tokens amount
+* @property {string} buying - Bought asset address
+* @property {bigint} id - Unique trade id
+* @property {string} maker - Seller account address
+* @property {bigint} order - Order id
+* @property {string} selling - Sold asset address
+* @property {bigint} sold - Sold tokens amount
+* @property {string} taker - Trader account address
+*/
+
+/**
+ * @typedef {object} SwapContractEvent - Orderbook swap event
+ * @property {bigint} id - Unique swap id (last trade id assigned while settling the swap legs)
+ * @property {string} trader - Trader account address
+ * @property {string} selling - Sold asset address
+ * @property {string} buying - Bought asset address
+ * @property {bigint} sold - Amount of `selling` tokens sold
+ * @property {bigint} bought - Amount of `buying` tokens received
+ */
