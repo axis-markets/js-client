@@ -1,5 +1,5 @@
-import {AxisContractClient, ContractErrors, TradeDirection, OrderKind, ApiClient, AxisApiError} from './index.js'
+import {AxisContractClient, ContractErrors, TradeDirection, OrderKind, AxisApiClient, AxisApiError} from './index.js'
 
-const axisContractClient = {AxisContractClient, ContractErrors, TradeDirection, OrderKind, ApiClient, AxisApiError}
+const axisClient = {AxisContractClient, ContractErrors, TradeDirection, OrderKind, AxisApiClient, AxisApiError}
 
-export default axisContractClient
+export default axisClient

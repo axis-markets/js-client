@@ -77,16 +77,6 @@ export interface TradeStep {
     orders: Array<bigint>;
 }
 
-/** Orderbook swap event */
-export interface Swap {
-    /** Amount of `buying` tokens received */
-    bought: bigint;
-    /** Amount of `selling` tokens sold */
-    sold: bigint;
-    /** Trader account address */
-    trader: string;
-}
-
 /** Standard contract errors */
 export declare const ContractErrors: {
     701: {message: "NotAuthorized"};
@@ -453,7 +443,7 @@ export interface ApiTrade {
 }
 
 /** HTTP client for the AXIS Aggregator REST API */
-export declare class ApiClient {
+export declare class AxisApiClient {
     /** @param serverUrl - Base URL of the Aggregator server */
     constructor(serverUrl: string);
 

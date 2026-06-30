@@ -6,18 +6,19 @@ module.exports = function () {
         mode: 'production',
         devtool: 'source-map',
         entry: {
-            axisContractClient: [path.join(__dirname, '/src/cjs.js')]
+            axisClient: [path.join(__dirname, '/src/cjs.js')]
         },
         output: {
             path: path.join(__dirname, './lib'),
-            filename: '[name].js',
+            filename: 'axis-client.cjs',
             library: {
-                name: 'axisContractClient',
+                name: 'axisClient',
                 type: 'umd',
                 export: 'default'
             },
             libraryTarget: 'umd',
-            globalObject: 'this'
+            globalObject: 'this',
+            clean: true
         },
         module: {
             rules: [

@@ -3,7 +3,7 @@
 JavaScript SDK for [AXIS](https://axis.markets) Stellar DEX.
 
 - **`AxisContractClient`** — wraps the on-chain AXIS smart contract for order management and trading (sign & send transactions, read orders).
-- **`ApiClient`** — a dependency-free HTTP client for the AXIS Aggregator and Indexer REST API (quotes, orderbook depth, candles, ticker, market/order/trade data).
+- **`AxisApiClient`** — a dependency-free HTTP client for the AXIS Aggregator and Indexer REST API (quotes, orderbook depth, candles, ticker, market/order/trade data).
 
 ## Installation
 
@@ -201,14 +201,14 @@ Orderbook swap event emitted by the contract.
 | `bought` | `bigint` | Amount of `buying` tokens received. |
 
 
-## ApiClient
+## AxisApiClient
 
 HTTP client for the AXIS Aggregator REST API. Uses the standard `fetch` API - no extra dependencies.
 
 ```js
-import {ApiClient, AxisApiError} from '@axis-markets/client'
+import {AxisApiClient, AxisApiError} from '@axis-markets/client'
 
-const api = new ApiClient('https://aggregator.axis.markets')
+const api = new AxisApiClient('https://aggregator.axis.markets')
 
 // Quote: sell a fixed amount of the source asset (strict send)
 const sellQuote = await api.quoteSell({
@@ -234,7 +234,7 @@ const candles = await api.getCandles({market: 'XLM/USDC', resolution: '1h', orde
 const {ticker} = await api.getTicker24h()
 ```
 
-### ApiClient Methods
+### AxisApiClient Methods
 
 | Method | Description |
 |---|---|

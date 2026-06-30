@@ -23,7 +23,7 @@ export class AxisApiError extends Error {
 /**
  * HTTP client for the AXIS Aggregator REST API
  */
-export class ApiClient {
+export class AxisApiClient {
     /**
      * @param {string} serverUrl - Base URL of the Aggregator server
      */
