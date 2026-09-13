@@ -6,17 +6,27 @@ module.exports = function () {
         mode: 'production',
         devtool: 'source-map',
         entry: {
-            axisClient: [path.join(__dirname, '/src/cjs.js')]
+            axisClient: {
+                import: path.join(__dirname, '/src/cjs.js'),
+                filename: 'axis-client.cjs',
+                library: {
+                    name: 'axisClient',
+                    type: 'umd',
+                    export: 'default'
+                }
+            },
+            axisFootprint: {
+                import: path.join(__dirname, '/src/footprint-cjs.js'),
+                filename: 'footprint.cjs',
+                library: {
+                    name: 'axisFootprint',
+                    type: 'umd',
+                    export: 'default'
+                }
+            }
         },
         output: {
             path: path.join(__dirname, './lib'),
-            filename: 'axis-client.cjs',
-            library: {
-                name: 'axisClient',
-                type: 'umd',
-                export: 'default'
-            },
-            libraryTarget: 'umd',
             globalObject: 'this',
             clean: true
         },
@@ -29,6 +39,7 @@ module.exports = function () {
                 }
             ]
         },
+        externalsType: 'umd',
         externals: {
             '@stellar/stellar-sdk': '@stellar/stellar-sdk'
         },

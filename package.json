@@ -1,6 +1,6 @@
 {
   "name": "@axis-markets/client",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "AXIS contract and API client",
   "author": "team@stellar.expert",
   "license": "MIT",
@@ -14,6 +14,11 @@
       "import": "./src/index.js",
       "require": "./lib/axis-client.cjs"
     },
+    "./footprint": {
+      "types": "./src/footprint.d.ts",
+      "import": "./src/footprint.js",
+      "require": "./lib/footprint.cjs"
+    },
     "./package.json": "./package.json"
   },
   "homepage": "https://axis.markets",
@@ -23,6 +28,7 @@
   },
   "bugs": "https://github.com/axis-markets/js-client/issues",
   "scripts": {
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "prepare": "webpack --mode=production --config webpack.config.cjs"
   },
   "peerDependencies": {
@@ -43,6 +49,7 @@
   "files": [
     "src/",
     "lib/",
-    "!src/cjs.js"
+    "!src/cjs.js",
+    "!src/footprint-cjs.js"
   ]
 }

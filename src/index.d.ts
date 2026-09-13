@@ -100,6 +100,8 @@ export interface ClientInitializationParams {
     networkPassphrase?: string;
     /** Transaction fee (0.1 XLM by default) */
     fee?: string;
+    /** Declare every supplied order id in the read-write footprint of trading transactions (enabled by default) */
+    autoFootprint?: boolean;
 }
 
 export type SignTransactionCallback = (

@@ -1,7 +1,8 @@
-import {Networks} from '@stellar/stellar-sdk'
+import {Networks, contract} from '@stellar/stellar-sdk'
 import ContractClient from './contract-client.js'
 import {ContractErrors, processSimulationErrors} from './errors.js'
 import {AxisApiClient, AxisApiError} from './api-client.js'
+import {collectOrderIds, ensureOrdersFootprint} from './footprint.js'
 
 export {ContractErrors, AxisApiClient, AxisApiError}
 
@@ -39,6 +40,20 @@ export class AxisContractClient {
         }
         this.client = new ContractClient(options)
         this.fee = params.fee || '100000'
+        this.autoFootprint = params.autoFootprint !== false
+    }
+
+    /**
+     * Declare all order ids of a simulated call in the read-write footprint (if enabled)
+     * @param {contract.AssembledTransaction} tx - Simulated transaction
+     * @param {...Array<bigint>} idLists - Order ids passed to the contract call
+     * @private
+     */
+    updateFootprint(tx, ...idLists) {
+        if (this.autoFootprint) {
+            const orderIds = collectOrderIds(...idLists)
+            ensureOrdersFootprint(tx, this.client.options.contractId, orderIds)
+        }
     }
 
     /**
@@ -87,6 +102,7 @@ export class AxisContractClient {
     async fill_order(trader, takerOrderId, orders) {
         const tx = await this.client.fill_order({trader, taker_order_id: takerOrderId, orders}, {fee: this.fee})
         processSimulationErrors(tx)
+        this.updateFootprint(tx, [takerOrderId], orders)
         const res = await tx.signAndSend()
         return [res.result.sold, res.result.bought]
     }
@@ -125,6 +141,7 @@ export class AxisContractClient {
             path: params.path.map(step => ({asset: step.asset, orders: step.orders}))
         }, {fee: this.fee})
         processSimulationErrors(tx)
+        this.updateFootprint(tx, ...params.path.map(step => step.orders))
         const res = await tx.signAndSend()
         return [res.result.sold, res.result.bought]
     }
@@ -143,6 +160,7 @@ async function execTrade(params, direction, context) {
     }
     const tx = await context.client.trade(payload, {fee: context.fee})
     processSimulationErrors(tx)
+    context.updateFootprint(tx, params.orders)
     const {result} = await tx.signAndSend()
     return [result[0], result[1], result[2]]
 }
@@ -155,6 +173,7 @@ async function execTrade(params, direction, context) {
  * @property {string} contractId - DEX contract ID
  * @property {string} [networkPassphrase] - Network passphrase (Pubnet passphrase by default)
  * @property {string} [fee] - Transaction fee (0.1 XLM by default)
+ * @property {boolean} [autoFootprint] - Declare every supplied order id in the read-write footprint of trading transactions (enabled by default)
  */
 
 /**
