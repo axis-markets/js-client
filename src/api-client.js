@@ -108,6 +108,14 @@ export class AxisApiClient {
     }
 
     /**
+     * Contract state tracked by the indexer: frozen switch, configuration and active markets
+     * @return {Promise<ContractInfo>} - Contract state
+     */
+    async getContract() {
+        return this.request('/contract')
+    }
+
+    /**
      * Retrieve active orders, filterable by owner or asset
      * @param {OrdersParams} [params] - Filter parameters
      * @return {Promise<ApiOrder[]>} - Active orders matching the filter
@@ -119,7 +127,7 @@ export class AxisApiClient {
     /**
      * Retrieve a single order by ID
      * @param {bigint|string|number} id - Order ID
-     * @return {Promise<ApiOrder|null>} - Order, or null if not found
+     * @return {Promise<ApiOrder>} - Order (throws AxisApiError with status 404 if not found)
      */
     async getOrder(id) {
         return this.request(`/order/${encodeURIComponent(id.toString())}`)
@@ -215,6 +223,8 @@ export class AxisApiClient {
  * @property {string} selling - Selling asset contract id at this hop
  * @property {string} buying - Buying asset contract id at this hop
  * @property {string[]} orders - Maker order IDs matched at this hop
+ * @property {string} [worstPrice] - Highest price among the matched orders (maker `buying` per `selling`, 18 decimals):
+ * a trade limit at this price crosses every listed order
  */
 
 /**
@@ -281,9 +291,32 @@ export class AxisApiClient {
  */
 
 /**
+ * @typedef {{}} ContractInfo - Contract state tracked by the indexer
+ * @property {boolean} frozen - Whether trading is blocked by the safety admin
+ * @property {ContractInfoConfig} [config] - Contract configuration
+ * @property {ContractInfoMarket[]} markets - Markets opened by `subsidize`
+ */
+
+/**
+ * @typedef {{}} ContractInfoConfig
+ * @property {string} safetyAdmin - Safety admin address
+ * @property {string} oracle - Price oracle contract address
+ * @property {string} marketListingFee - Fee token amount burned to open a market
+ * @property {string} minTradeSize - Minimum trade value in USD with 7 decimals (0 = disabled)
+ */
+
+/**
+ * @typedef {{}} ContractInfoMarket
+ * @property {string} a - First market asset
+ * @property {string} b - Second market asset
+ * @property {string} created - Creation timestamp (UTC)
+ * @property {string} refreshed - Last oracle check timestamp (UTC)
+ */
+
+/**
  * @typedef {{}} OrdersParams
  * @property {string} [owner] - Filter by order owner address
- * @property {string|string[]} [asset] - Filter by asset(s) - matches orders selling or buying any of them
+ * @property {string|string[]} [asset] - Filter by asset(s) - every listed asset must be one of the order assets (two assets select a pair)
  * @property {string|bigint} [cursor] - Pagination cursor (order id)
  * @property {number|string} [limit] - Max orders to return
  */
@@ -306,19 +339,18 @@ export class AxisApiClient {
 
 /**
  * @typedef {{}} ApiOrder - Serialized order returned by the API
- * @property {string} id - Order ID
- * @property {string} status - Order status (`ACTIVE`|`FILLED`|`CANCELED`)
- * @property {string} kind - Order kind (`LIMIT`)
+ * @property {string} id - Order ID (decimal u128)
+ * @property {'ACTIVE'|'FILLED'|'CANCELED'|'EXPIRED'} status - Order status: `ACTIVE`, `FILLED`, `CANCELED` (removed by the owner) or `EXPIRED` (archived once past `expires`)
  * @property {string} buying - Buying asset contract id
  * @property {string} selling - Selling asset contract id
  * @property {string} price - Order price
  * @property {string} rprice - Rational price representation
- * @property {string} quote - Total quote amount
- * @property {string} amount - Amount left to sell/buy
+ * @property {string} quote - Selling amount at creation
+ * @property {string} amount - Amount left to sell
+ * @property {string} [backed] - Amount the maker can actually deliver, when the indexer tracks backing
+ * @property {ApiOrderBacking} [backing] - Maker backing details, when the indexer tracks backing
  * @property {string} owner - Maker address
  * @property {string} [expires] - Expiration timestamp (UTC)
- * @property {string} [iceberg] - Iceberg amount
- * @property {string} [stop] - Stop price
  * @property {string} [created] - Creation timestamp (UTC)
  * @property {string} [updated] - Last update timestamp (UTC)
  * @property {string} [cursor] - Pagination cursor
@@ -326,6 +358,7 @@ export class AxisApiClient {
 
 /**
  * @typedef {{}} ApiTrade - Serialized trade returned by the API
+ * @property {'trade'} type - Record type
  * @property {string} id - Trade ID
  * @property {string} order - Matched order ID
  * @property {string} taker - Taker account address
@@ -334,6 +367,7 @@ export class AxisApiClient {
  * @property {string} boughtAsset - Bought asset contract id
  * @property {string} sold - Sold tokens amount
  * @property {string} bought - Bought tokens amount
+ * @property {string} [left] - Order amount left after the fill
  * @property {string} price - Approximate trade price
  * @property {string} [cursor] - Pagination cursor
  * @property {string} timestamp - Trade timestamp (UTC)

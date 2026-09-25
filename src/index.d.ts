@@ -13,60 +13,167 @@ export enum TradeDirection {
 
 /** Order properties, stored on-chain */
 export interface Order {
-    /** Amount left to sell/buy */
+    /** Amount left to sell */
     amount: bigint;
     /** Buying token address */
     buying: string;
-    /** expiration timestamp */
+    /** Expiration timestamp (0 = no expiration) */
     expires: bigint;
-    /** Unique order identifier */
+    /** Unique order identifier, derived from the owner and the client nonce */
     id: bigint;
-    /** Order type */
-    kind: OrderKind;
     /** Maker address */
     owner: string;
-    /** Order price */
+    /** Order price (`buying` per 1 `selling`, 18 decimals) */
     price: bigint;
-    /** Initial selling/buying amount */
-    quote: bigint;
     /** Selling token address */
     selling: string;
 }
 
-/** Orderbook trade event */
-export interface TradeContractEvent {
-    /** Bought tokens amount */
-    bought: bigint;
-    /** Bought asset address */
-    buying: string;
-    /** Unique trade id */
-    id: bigint;
-    /** Seller account address */
-    maker: string;
-    /** Order id */
-    order: bigint;
-    /** Sold asset address */
-    selling: string;
-    /** Sold tokens amount */
-    sold: bigint;
-    /** Trader account address */
-    taker: string;
+/** Token allowance granted to the contract as part of the call */
+export interface Approval {
+    /** Token the allowance is granted on: defaults to `selling` for `buy`, `sell` and `swap`, required in `update` approvals */
+    asset?: string;
+    /** Absolute allowance amount (0 revokes) */
+    amount: bigint;
+    /** Ledger sequence the allowance lives until */
+    liveUntil: number;
 }
 
-/** Orderbook swap event */
-export interface SwapContractEvent {
-    /** Unique swap id (last trade id assigned while settling the swap legs) */
+/** New amount, price and expiration for an existing order */
+export interface OrderUpdate {
+    /** Order id */
     id: bigint;
+    /** New amount to sell, 0 removes the order */
+    amount: bigint;
+    /** New order price (ignored for a removal) */
+    price: bigint;
+    /** New expiration UNIX timestamp (in seconds), 0 or omitted = no expiration */
+    expires?: bigint | number;
+}
+
+/** Contract configuration: the oracle, the safety admin and the minimum trade size are supplied at deployment */
+export interface Config {
+    /** Reflector Beam price oracle contract address */
+    oracle: string;
+    /** Amount of XRF stroops burned by the market creator to provision the oracle price feeds (the oracle's daily fee times 90, derived whenever the oracle is set) */
+    market_listing_fee: bigint;
+    /** Account allowed to freeze the contract, change the minimum trade size and replace the oracle */
+    safety_admin: string;
+    /** Minimum trade value in USD with 7 decimals (1 USD = 10_000_000), zero disables the limit */
+    min_trade_size: bigint;
+}
+
+/** Market asset descriptor */
+export interface MarketSide {
+    /** Token contract address */
+    asset: string;
+    /** Whether the asset is quoted by the oracle */
+    listed: boolean;
+    /** Token decimals (fetched only for listed assets) */
+    decimals: number;
+}
+
+/** Market record, stored on-chain */
+export interface Market {
+    /** First asset (canonical order) */
+    a: MarketSide;
+    /** Second asset (canonical order) */
+    b: MarketSide;
+    /** Creation timestamp */
+    created: bigint;
+}
+
+/** Orderbook `trade` event, one per fill (topics: `trade`, `selling`, `buying`) */
+export interface TradeContractEvent {
+    /** Asset sold by the taker (topic) */
+    selling: string;
+    /** Asset bought by the taker (topic) */
+    buying: string;
+    /** Maker order id */
+    order: bigint;
+    /** Trader account address */
+    taker: string;
+    /** Seller account address */
+    maker: string;
+    /** Sold tokens amount */
+    sold: bigint;
+    /** Bought tokens amount */
+    bought: bigint;
+    /** Order amount left after the fill (0 = removed) */
+    left: bigint;
+}
+
+/** Orderbook `swap` event, one per call (topics: `swap`, `selling`, `buying`) */
+export interface SwapContractEvent {
+    /** Asset sold by the trader (topic) */
+    selling: string;
+    /** Asset received by the trader (topic) */
+    buying: string;
     /** Trader account address */
     trader: string;
-    /** Sold asset address */
-    selling: string;
-    /** Bought asset address */
-    buying: string;
     /** Amount of `selling` tokens sold */
     sold: bigint;
     /** Amount of `buying` tokens received */
     bought: bigint;
+}
+
+/** Orderbook `new` event, an order created (topics: `new`, `selling`, `buying`) */
+export interface OrderCreatedContractEvent {
+    /** Selling asset address (topic) */
+    selling: string;
+    /** Buying asset address (topic) */
+    buying: string;
+    /** Unique order identifier */
+    id: bigint;
+    /** Maker address */
+    owner: string;
+    /** Order price */
+    price: bigint;
+    /** Current amount */
+    amount: bigint;
+    /** Expiration timestamp (0 = no expiration) */
+    expires: bigint;
+}
+
+/** Orderbook `mod` event, an order changed outside a fill (topics: `mod`) */
+export interface OrderUpdatedContractEvent {
+    /** Unique order identifier */
+    id: bigint;
+    /** Order price */
+    price: bigint;
+    /** Current amount (0 = removed) */
+    amount: bigint;
+    /** Expiration timestamp (0 = no expiration) */
+    expires: bigint;
+}
+
+/**
+ * Orderbook `skip` event, a listed order its maker could not settle (backing short of the fill, cannot receive the
+ * taker's asset, or the transfer failed); the order is left unchanged (topics: `skip`)
+ */
+export interface OrderSkippedContractEvent {
+    /** Order id */
+    order: bigint;
+}
+
+/** Orderbook `refresh` event, a market checked against the oracle (topics: `refresh`, `a`, `b`; no data) */
+export interface MarketRefreshContractEvent {
+    /** First market asset (canonical order, topic) */
+    a: string;
+    /** Second market asset (canonical order, topic) */
+    b: string;
+}
+
+/** `freeze` event (topics: `freeze`) */
+export interface FreezeContractEvent {
+    /** Whether trading is blocked after the call */
+    frozen: boolean;
+}
+
+/** `config` event, the configuration set by the constructor, `delegate`, `set_oracle` or `set_floor` (topics: `config`) */
+export interface ConfigChangedContractEvent {
+    /** Contract configuration after the call */
+    config: Config;
 }
 
 /** A trade step in a multi-market swap path. */
@@ -81,11 +188,30 @@ export interface TradeStep {
 export declare const ContractErrors: {
     701: {message: "NotAuthorized"};
     702: {message: "InsufficientBalance"};
-    703: {message: "OrderNotFound"};
-    704: {message: "Overflow"};
-    705: {message: "InvalidMatch"};
-    706: {message: "InvalidPrice"};
+    703: {message: "InsufficientAllowance"};
+    704: {message: "InvalidMatch"};
+    705: {message: "InvalidPrice"};
+    706: {message: "InvalidAmount"};
+    707: {message: "InvalidExpiration"};
+    708: {message: "CannotReceive"};
+    709: {message: "NotFilled"};
+    710: {message: "OrderNotFound"};
+    711: {message: "OrderExists"};
+    720: {message: "OrderSizeTooSmall"};
+    721: {message: "AssetsNotVerifiedByOracle"};
+    722: {message: "AssetPriceOracleFetchFailed"};
+    723: {message: "InvalidOracleConfig"};
+    730: {message: "Frozen"};
+    740: {message: "Overflow"};
 }
+
+/**
+ * Compute the id of the order `owner` creates with `nonce`
+ * (first 16 bytes of `sha256(xdr([owner, nonce]))` as a big-endian u128)
+ * @param owner - Order owner address
+ * @param nonce - u64 nonce the order was created with
+ */
+export declare function orderId(owner: string, nonce: bigint | number | string): bigint;
 
 export interface ClientInitializationParams {
     /** Public key of the account that will interact with the contract */
@@ -100,7 +226,7 @@ export interface ClientInitializationParams {
     networkPassphrase?: string;
     /** Transaction fee (0.1 XLM by default) */
     fee?: string;
-    /** Declare every supplied order id in the read-write footprint of trading transactions (enabled by default) */
+    /** Declare every supplied order id, and the balances and allowances of the makers behind them, in the read-write footprint of trading transactions (enabled by default) */
     autoFootprint?: boolean;
 }
 
@@ -123,7 +249,11 @@ export interface TradeArguments {
     /** Price a trader willing to accept */
     price: bigint;
     /** List of order IDs to match before creating the order on-chain */
-    orders: Array<bigint>;
+    orders?: Array<bigint>;
+    /** Expiration UNIX timestamp (in seconds) of the order created for a `Limit` remainder, 0 or omitted = no expiration */
+    expires?: bigint | number;
+    /** Optional allowance granted to the contract before trading (on `selling` unless `asset` is set) */
+    approve?: Approval;
 }
 
 export interface SellTradeArguments extends TradeArguments {
@@ -147,59 +277,103 @@ export interface SwapArguments {
     trader: string,
     /** Token address sent by the trader */
     selling: string,
-    /** Maximum amount of selling tokens to send */
+    /** Amount of selling tokens to send (`Sell`) or the maximum to spend (`Buy`) */
     sellingAmount: bigint,
-    /** Minimum amount of buying tokens to receive */
+    /** Minimum amount of buying tokens to receive (`Sell`) or the exact amount (`Buy`) */
     buyingAmount: bigint,
     /** Ordered list of the trade route steps */
-    path: Array<TradeStep>
+    path: Array<TradeStep>,
+    /** Optional allowance granted to the contract before trading (on `selling` unless `asset` is set) */
+    approve?: Approval
+}
+
+export interface UpdateArguments {
+    /** Orders owner */
+    trader: string;
+    /** New amount, price and expiration per order id */
+    updates: Array<OrderUpdate>;
+    /** Allowances granted before the backing check, each naming its `asset`; an asset without one keeps its current allowance */
+    approvals?: Array<Approval & {asset: string}>;
+}
+
+export interface SubsidizeArguments {
+    /** Address paying for the oracle feeds (and the listing fee of a new market) */
+    sponsor: string;
+    /** First market asset */
+    selling: string;
+    /** Second market asset (either order opens the same market) */
+    buying: string;
+    /** Amount of XRF fee tokens to burn, at least `Config.market_listing_fee` to open a market */
+    amount: bigint;
 }
 
 export declare class AxisContractClient {
     constructor(params: ClientInitializationParams);
 
     /**
-     * Retrieve last order id
-     * @returns Last created order id
-     */
-    last(): Promise<bigint>;
-
-    /**
      * Fetch existing order
      * @param id - ID of the order to fetch
-     * @returns Order fetched from the storage
+     * @returns Order fetched from the storage, undefined if not found or expired
      */
-    order(id: bigint): Promise<Order>;
+    order(id: bigint): Promise<Order | undefined>;
+
+    /** Fetch contract configuration */
+    loadConfig(): Promise<Config>;
 
     /**
-     * Cancel existing order
-     * @param ids - ID of the order to cancel
+     * Check whether the contract is frozen
+     * @returns `true` if contract is frozen (trading and order management operations blocked)
+     */
+    isFrozen(): Promise<boolean>;
+
+    /**
+     * Fetch market for the asset pair
+     * @param selling - First market asset
+     * @param buying - Second market asset
+     * @returns Market record if the market exists
+     */
+    getMarket(selling: string, buying: string): Promise<Market | undefined>;
+
+    /**
+     * Cancel existing orders, expired ones included: `update` with a zero amount per order (the contract has no
+     * `cancel`). The contract holds no funds, so nothing is returned. A transaction fits about 110 orders
+     * @param ids - IDs of the orders to cancel (non-existent ids are silently skipped)
      * @param trader - Trader address
      */
     cancel(ids: Array<bigint>, trader: string): Promise<void>;
 
     /**
-     * Fill existing orders using another matching order from the orderbook
+     * Update the amount, price, or expiration of several orders in place, or remove them.
+     * Orders that no longer exist are skipped; expired orders revived with the new expiration.
+     * A zero amount removes the order, expired ones included. An updated order's entry lifetime is extended to cover
+     * its expiration +1 day. Approvals and removals work in a frozen contract. A transaction fits about 110 orders
+     * @param params - Update parameters
+     * @returns IDs of the orders updated or removed
+     */
+    update(params: UpdateArguments): Promise<Array<bigint>>;
+
+    /**
+     * Fill an order on the book against matching orders; the spread crossed goes to `trader`
      * @param trader - Trader address
      * @param takerOrderId - ID of the order that serves as a taker
      * @param orders - List of order IDs to match
-     * @returns Amount of sold and bought tokens
+     * @returns Amount the taker order sold, amount the makers delivered, surplus paid to the trader
      */
-    fill_order(trader: string, takerOrderId: bigint, orders: Array<bigint>): Promise<[bigint, bigint]>;
+    crossfill(trader: string, takerOrderId: bigint, orders: Array<bigint>): Promise<[bigint, bigint, bigint]>;
 
     /**
      * Trade with DEX and create buy limit order if quote not executed in full
      * @param params - Trade parameters
      * @returns Amount of sold tokens, bought tokens, and ID of the newly created order if any
      */
-    buy(params: BuyTradeArguments): Promise<[bigint, bigint, bigint]>;
+    buy(params: BuyTradeArguments): Promise<[bigint, bigint, bigint | undefined]>;
 
     /**
      * Trade with DEX and create sell limit order if quote not executed in full
      * @param params - Trade parameters
      * @returns Amount of sold tokens, bought tokens, and ID of the newly created order if any
      */
-    sell(params: SellTradeArguments): Promise<[bigint, bigint, bigint]>;
+    sell(params: SellTradeArguments): Promise<[bigint, bigint, bigint | undefined]>;
 
     /**
      * Swap tokens across several markets.
@@ -207,6 +381,29 @@ export declare class AxisContractClient {
      * @returns Amount of sold tokens and bought tokens
      */
     swap(params: SwapArguments): Promise<[bigint, bigint]>;
+
+    /** Extend the contract instance and code lifetime. Permissionless, works while frozen */
+    keepalive(): Promise<void>;
+
+    /**
+     * Re-check both market assets against the price oracle and cache oracle prices.
+     * A cached price is valid for up to 72 hours. A market without quoted assets stops accepting new limit orders; its
+     * outstanding orders stay cancellable and fillable. The record and the cached prices are rewritten only when they
+     * change; a call that would write nothing is not sent (the simulated record is returned). Permissionless, blocked
+     * while frozen
+     * @param selling - First market asset
+     * @param buying - Second market asset
+     * @returns Updated market record, undefined if the market does not exist
+     */
+    requote(selling: string, buying: string): Promise<Market | undefined>;
+
+    /**
+     * Extend oracle price feeds access for a market, opening the market if it does not exist yet. Exactly `amount` of
+     * XRF is burned from the sponsor; opening a market takes `Config.market_listing_fee` out of `amount`
+     * @param params - Subsidy parameters
+     * @returns New access expiration UNIX timestamps (in seconds) per oracle-listed asset
+     */
+    subsidize(params: SubsidizeArguments): Promise<Array<bigint>>;
 }
 
 /** Error thrown when the Aggregator API responds with a non-success HTTP status */
@@ -235,6 +432,8 @@ export interface QuotePathStep {
     buying: string;
     /** Maker order IDs matched at this hop */
     orders: string[];
+    /** Highest price among the matched orders (maker `buying` per `selling`, 18 decimals): a trade limit at this price crosses every listed order */
+    worstPrice?: string;
 }
 
 export interface QuotePath {
@@ -349,12 +548,40 @@ export interface MarketInfo {
     orderTypes: string[];
 }
 
+/** Contract state tracked by the indexer */
+export interface ContractInfo {
+    /** Whether trading is blocked by the safety admin */
+    frozen: boolean;
+    /** Contract configuration (absent until the indexer saw a `config` event) */
+    config?: {
+        /** Safety admin address */
+        safetyAdmin: string;
+        /** Price oracle contract address */
+        oracle: string;
+        /** Fee token amount burned to open a market */
+        marketListingFee: string;
+        /** Minimum trade value in USD with 7 decimals (0 = disabled) */
+        minTradeSize: string;
+    };
+    /** Markets opened by `subsidize` */
+    markets: Array<{
+        /** First market asset (the contract's canonical `Address` order) */
+        a: string;
+        /** Second market asset */
+        b: string;
+        /** Creation timestamp (UTC) */
+        created: string;
+        /** Last oracle check timestamp (UTC) */
+        refreshed: string;
+    }>;
+}
+
 export interface OrdersParams {
     /** Filter by order owner address */
     owner?: string;
-    /** Filter by asset(s) - matches orders selling or buying any of them */
+    /** Filter by asset(s) - every listed asset must be one of the order assets (two assets select a pair) */
     asset?: string | string[];
-    /** Pagination cursor (order id) */
+    /** Pagination cursor (the `cursor` field of the last received order) */
     cursor?: string | bigint;
     /** Max orders to return */
     limit?: number | string;
@@ -365,7 +592,7 @@ export interface OrderHistoryParams {
     owner?: string;
     /** Asset pair `[base, quote]` (contract ids) */
     pair?: string[];
-    /** Pagination cursor (order id) */
+    /** Pagination cursor (the `cursor` field of the last received order) */
     cursor?: string | bigint;
     /** Max orders to return */
     limit?: number | string;
@@ -382,14 +609,26 @@ export interface TradesParams {
     limit?: number | string;
 }
 
+/** Backing of an order maker in the asset the order sells, as tracked by the indexer */
+export interface ApiOrderBacking {
+    /** Maker token balance */
+    balance: string;
+    /** Allowance granted to the AXIS contract */
+    allowance: string;
+    /** Ledger sequence the allowance lives until */
+    liveUntil: number;
+    /** Whether the maker trustline is authorized */
+    authorized: boolean;
+    /** Last refresh timestamp (UTC) */
+    updated: string;
+}
+
 /** Serialized order returned by the API */
 export interface ApiOrder {
-    /** Order ID */
+    /** Order ID (decimal u128) */
     id: string;
-    /** Order status (`ACTIVE`|`FILLED`|`CANCELED`) */
-    status: string;
-    /** Order kind (`LIMIT`) */
-    kind: string;
+    /** Order status: `ACTIVE`, `FILLED`, `CANCELED` (removed by the owner) or `EXPIRED` (archived once past `expires`, back to `ACTIVE` if the owner revives it) */
+    status: 'ACTIVE' | 'FILLED' | 'CANCELED' | 'EXPIRED';
     /** Buying asset contract id */
     buying: string;
     /** Selling asset contract id */
@@ -398,18 +637,18 @@ export interface ApiOrder {
     price: string;
     /** Rational price representation */
     rprice: string;
-    /** Total quote amount */
+    /** Selling amount at creation */
     quote: string;
-    /** Amount left to sell/buy */
+    /** Amount left to sell */
     amount: string;
+    /** Amount the maker can actually deliver (`min(amount, balance, allowance)`), when the indexer tracks backing */
+    backed?: string;
+    /** Maker backing details, when the indexer tracks backing */
+    backing?: ApiOrderBacking;
     /** Maker address */
     owner: string;
     /** Expiration timestamp (UTC) */
     expires?: string;
-    /** Iceberg amount */
-    iceberg?: string;
-    /** Stop price */
-    stop?: string;
     /** Creation timestamp (UTC) */
     created?: string;
     /** Last update timestamp (UTC) */
@@ -420,6 +659,8 @@ export interface ApiOrder {
 
 /** Serialized trade returned by the API */
 export interface ApiTrade {
+    /** Record type */
+    type: 'trade';
     /** Trade ID */
     id: string;
     /** Matched order ID */
@@ -436,6 +677,8 @@ export interface ApiTrade {
     sold: string;
     /** Bought tokens amount */
     bought: string;
+    /** Order amount left after the fill */
+    left?: string;
     /** Approximate trade price */
     price: string;
     /** Pagination cursor */
@@ -494,6 +737,12 @@ export declare class AxisApiClient {
     getMarkets(params?: MarketsParams): Promise<MarketInfo[]>;
 
     /**
+     * Contract state tracked by the indexer: frozen switch, configuration and the markets opened by `subsidize`
+     * @returns Contract state
+     */
+    getContract(): Promise<ContractInfo>;
+
+    /**
      * Retrieve active orders, filterable by owner or asset
      * @param params - Filter parameters
      * @returns Active orders matching the filter
@@ -503,9 +752,9 @@ export declare class AxisApiClient {
     /**
      * Retrieve a single order by ID
      * @param id - Order ID
-     * @returns Order, or null if not found
+     * @returns Order (throws `AxisApiError` with status 404 if not found)
      */
-    getOrder(id: bigint | string | number): Promise<ApiOrder | null>;
+    getOrder(id: bigint | string | number): Promise<ApiOrder>;
 
     /**
      * Retrieve archived/historical orders
