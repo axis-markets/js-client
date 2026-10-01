@@ -46,8 +46,8 @@ describe('contract entry points', () => {
     })
 
     test('the client exposes no method the contract spec lacks', () => {
-        //`cancel` is sugar over `update`, the contract has no such function
-        const clientOnly = ['constructor', 'updateFootprint', 'updateTradeFootprint', 'buy', 'sell', 'cancel']
+        //`cancel` is sugar over `update`, the contract has no such function; `publicKey` is the signing account
+        const clientOnly = ['constructor', 'updateFootprint', 'updateTradeFootprint', 'buy', 'sell', 'cancel', 'publicKey']
         const fromSpec = client.spec.funcs().map(fn => fn.name.toString())
         const exposed = Object.getOwnPropertyNames(AxisContractClient.prototype).filter(name => !clientOnly.includes(name))
         expect(exposed.filter(name => !fromSpec.includes(contractName(name)))).toEqual([])
@@ -277,7 +277,7 @@ describe('AxisContractClient argument mapping', () => {
     test('cancel removes the orders through update', async () => {
         const axis = makeClient()
         const {calls, footprints} = stub(axis, 'update', [1n, HIGH_ID])
-        expect(await axis.cancel([1n, HIGH_ID], TRADER)).toBeUndefined()
+        expect(await axis.cancel(TRADER, [1n, HIGH_ID])).toBeUndefined()
         expect(calls[0].args).toEqual({
             trader: TRADER,
             updates: [

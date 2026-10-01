@@ -2,10 +2,14 @@
 
 JavaScript SDK for [AXIS](https://axis.markets) Stellar DEX.
 
+- **`Axis`**, **`AxisMarket`**, **`AxisAccount`** — high-level API stateful: the DEX state (contract, markets) and a
+  trader's open orders and allowances kept in memory from the Aggregator WebSocket push API, with trading calls that
+  look up the crossing orders and manage allowances automatically.
 - **`AxisContractClient`** — wraps the on-chain AXIS smart contract for order management and trading (sign & send
   transactions, read orders, markets and configuration).
 - **`AxisApiClient`** — a dependency-free HTTP client for the AXIS Aggregator and Indexer REST API (quotes, orderbook
   depth, candles, ticker, market/order/trade data).
+- **`AxisStreamClient`** — WebSocket client of the Aggregator push API.
 
 ## Installation
 
@@ -13,7 +17,102 @@ JavaScript SDK for [AXIS](https://axis.markets) Stellar DEX.
 npm i @axis-markets/client
 ```
 
-Requires Node.js 22+ (or any modern browser). `@stellar/stellar-sdk` 17+ is a peer dependency (v17 changed the XDR representation and is not source-compatible with v16).
+Requires Node.js 22+ (or any modern browser). `@stellar/stellar-sdk` 17+ is a peer dependency (v17 changed the XDR
+representation and is not source-compatible with v16).
+
+## Axis — high-level API
+
+`Axis` wrapper follows the contract state (frozen switch, configuration) and every market through the Aggregator push
+API, falling back to REST polling while the push connection is down. `axis.account()`
+returns an `AxisAccount` that keeps in memory all open orders of a trader across every market, and the trader's
+spendable balance and allowance in every market token, and trades with automatic allowance management. The Aggregator's
+data source streams updates for that state to maintain consistent up-to-date state in memory.
+
+```js
+import {Axis, TradeDirection} from '@axis-markets/client'
+
+const axis = new Axis({
+    apiUrl: 'https://aggregator.axis.markets',
+    rpcUrl: 'https://soroban-testnet.stellar.org',
+    contractId: 'CBJ747MKAGQO2LMJPOTCOONAWBLIIBSLOQE325R457TE5MIS6RTDJ4DC',
+    networkPassphrase: 'Test SDF Network ; September 2015'
+})
+await axis.connect()
+axis.on('frozen', frozen => console.log('trading', frozen ? 'suspended' : 'resumed'))
+
+const market = axis.getMarket(XLM, USDC) // either order: market.a / market.b are in the contract order
+
+const account = axis.account(publicKey, {signTransaction})
+await account.ready
+account.on('fill', ({order, sold, bought}) => console.log(`order ${order.id}: sold ${sold}, got ${bought}`))
+account.on('filled', ({order}) => console.log(`order ${order.id} filled`))
+account.on('expire', order => console.log(`order ${order.id} expired`))
+account.on('backing', ({asset}) => console.log(asset, 'balance', account.getBalance(asset)))
+
+// limit sell of 100 XLM at 0.25 USDC; crossing orders and the approval are handled by the account
+const {sold, bought, orderId} = await account.sell({
+    selling: XLM,
+    buying: USDC,
+    amount: 1_000_000_000n,
+    price: 25n * 10n ** 16n
+})
+// market buy of 10 XLM (no price: crosses the book at the worst quoted maker price)
+await account.buy({selling: USDC, buying: XLM, amount: 100_000_000n})
+await account.update([{id: orderId, amount: 500_000_000n}])
+await account.cancelAll({market})
+await account.swap({selling: USDC, buying: EURC, amount: 10_000_000n, direction: TradeDirection.Sell, slippage: 0.005})
+```
+
+**Allowances.** The contract holds no funds: an order is fillable up to `min(balance, allowance)` in the sold token, and
+one allowance record backs every order selling it. Before each `sell`, `buy`, `swap` and a growing `update`, the account
+checks the allowance and attaches to cover all active orders. A fill lowers the allowance and the order it fills in the
+same pushed ledger, so the memory state stays consistent. The allowance is read over RPC only when the push connection
+is down, the token is not tracked, or for 30 s after this client spent the token as a taker (the push reporting the
+spend may lag behind). An order this client created counts as committed right away (`pending: true`) until the indexer
+reports it.
+
+**Balances.** While an account is subscribed, the Aggregator tracks it in every market token.
+`account.balances` / `getBalance(asset)` give the spendable amount, and each change emits
+`backing` event.
+
+**Backing.** Each `AccountOrder` carries `backed` (its share of the budget, split by the indexer among the orders
+selling the token oldest first), `backedPct` and `backingPending`.
+`account.getAllowance(asset)` reports `balance`, `allowance`, `liveUntil`, `available` and `committed`.
+
+| `Axis` | Description |
+|---|---|
+| `connect()` | Load the contract state and follow its changes. |
+| `ledger`, `getLedger()` | Last ledger pushed by the Aggregator; current ledger (pushed, or RPC when stale). |
+| `frozen`, `config`, `markets`, `loaded` | Contract state; `markets` is a `Map` of `AxisMarket` by canonical key. |
+| `getMarket(x, y)` | Market of the asset pair in either order, `undefined` if not open. |
+| `getOrder(id)` | Live order from a tracked account's memory or the Aggregator, `undefined` if gone. |
+| `account(address, {signTransaction})` | `AxisAccount` of the trader (one per address). |
+| `subscribeTicker(cb)` | 24h ticker of every market (canonical orientation); also fills `market.ticker`. |
+| `keepalive(signer?)` | Extend the contract instance and code lifetime. |
+| `close()` | Stop following the contract and every account. |
+| events | `change`, `frozen`, `config`, `market` (`{market, created}`), `connection`, `ledger` |
+
+| `AxisMarket` | Description |
+|---|---|
+| `a`, `b`, `key`, `base`, `quote`, `created`, `refreshed` | Canonical assets (`base` = `a`) and oracle check times. |
+| `requote(signer?)` | Re-check the market against the oracle and cache prices (submits nothing when nothing changed). |
+| `subsidize({amount, sponsor?, signer?})` | Extend the oracle feeds access of the market. |
+| `getDepth({base?, depth?, step?, limit?})`, `subscribeDepth({base?, depth?, step?, limit?}, cb)` | Orderbook depth in the requested orientation, levels on multiples of `step`, pushed on book changes. |
+| `subscribeTrades(cb)` | Recent trades, then each new fill. |
+| `subscribeCandles({base?, resolution, limit?}, cb)` | Latest candles in the requested orientation (`limit`, default and max 200), then each candle changed by new trades. |
+
+| `AxisAccount` | Description |
+|---|---|
+| `orders`, `backing`, `ready`, `loaded` | Open orders by id and backing by token, in memory. |
+| `balances`, `getBalance(asset)`, `funded` | Spendable balances by token (every market token), whether the account exists. |
+| `getOrders({market?, selling?, buying?})` | Open orders, newest first, including `pending` ones this client created. |
+| `getOrder(id)`, `committed(asset)`, `getAllowance(asset)` | Order lookup, open amount selling a token, allowance summary. |
+| `sell(params)`, `buy(params)` | Trade (`{selling, buying, amount, price?, kind?, expires?, orders?, approve?}`); without `price` it is a market order. Returns `{sold, bought, orderId?, order?, approve?}`. |
+| `update(updates)` | Change orders (omitted fields keep their values). |
+| `cancel(ids)`, `cancelAll({market?})` | Remove orders (batches of 100). |
+| `crossfill(takerOrderId, orders?)` | Fill an open order against the book. |
+| `swap({selling, buying, amount, direction?, slippage?})` | Swap along the best Aggregator route. |
+| events | `ready`, `new`, `pending`, `fill`, `filled`, `update`, `cancel`, `expire`, `remove`, `order`, `backing`, `approve`, `trade`, `swap`, `change`, `error` |
 
 ## AxisContractClient
 
@@ -49,11 +148,16 @@ const order = await client.order(newOrderId)
 // Re-price an order in place (and keep it for another week)
 await client.update({
     trader: 'G...',
-    updates: [{id: newOrderId, amount: 500_0000n, price: 5_100_000n, expires: Math.floor(Date.now() / 1000) + 7 * 86_400}]
+    updates: [{
+        id: newOrderId,
+        amount: 500_0000n,
+        price: 5_100_000n,
+        expires: Math.floor(Date.now() / 1000) + 7 * 86_400
+    }]
 })
 
 // Cancel orders (an `update` with a zero amount under the hood)
-await client.cancel([newOrderId], 'G...')
+await client.cancel('G...', [newOrderId])
 ```
 
 See [`src/index.d.ts`](src/index.d.ts) for the full typed API.
@@ -68,27 +172,28 @@ See [`src/index.d.ts`](src/index.d.ts) for the full typed API.
 | `getMarket(selling, buying)` | Fetch the market record for an asset pair, either order (contract `market`). Returns `Promise<Market \| undefined>`. |
 | `buy(params)` | Trade with the DEX and create a buy limit order if the quote is not fully executed (`params: BuyTradeArguments`). Returns `Promise<[sold, bought, newOrderId \| undefined]>`. |
 | `sell(params)` | Trade with the DEX and create a sell limit order if the quote is not fully executed (`params: SellTradeArguments`). Returns `Promise<[sold, bought, newOrderId \| undefined]>`. |
-| `update(params)` | Change the amount, the price and the expiration of several orders in place or remove them (zero `amount`), and optionally set allowances; missing orders are skipped, expired ones are revived, and an updated order's entry lifetime is extended to cover its expiration +1 day (`params: UpdateArguments`). Approvals and removals work in a frozen contract. Returns `Promise<bigint[]>` with the ids updated or removed. |
-| `cancel(ids, trader)` | Cancel existing orders, expired ones included (`ids` is a `bigint[]`, `trader` is the owner address). Client sugar: the contract has no `cancel`, this calls `update` with a zero amount per id. Returns `Promise<void>`. |
-| `crossfill(trader, takerOrderId, orders)` | Cross an order on the book against matching orders; the crossed spread goes to `trader`. Returns `Promise<[sold, bought, profit]>`. |
-| `swap(params)` | Swap tokens across several markets along a route (`params: SwapArguments`). Returns `Promise<[sold, bought]>`. |
+| `update(params)` | Change the amount, the price and the expiration of several orders in place or remove them (zero `amount`), and optionally set allowances; missing orders are skipped, expired ones are revived, and an updated order's entry lifetime is extended to cover its expiration +1 day (`params: UpdateArguments`). Approvals and removals work in a frozen contract; up to 100 orders per transaction. Returns `Promise<bigint[]>` with the ids updated or removed. |
+| `cancel(trader, ids)` | Cancel existing orders, expired ones included (`trader` is the owner address; `ids` is a `bigint[]`, non-existent orders are ignored). Client sugar: the contract has no `cancel`, this calls `update` with a zero amount per id; up to 100 orders per transaction. Returns `Promise<void>`. |
+| `crossfill(trader, takerOrderId, orders)` | Fill an existing order against matching orders from the book; profits from price inefficiencies (the crossed spread) go to `trader`. Returns `Promise<[sold, bought, surplus]>`: the amount the taker order sold, the amount it received and the surplus paid to `trader`. |
+| `swap(params)` | Swap tokens across several markets along a route (`params: SwapArguments`); the contract holds the intermediate hop proceeds only within the call. Returns `Promise<[sold, bought]>`. |
 | `keepalive()` | Extend the contract instance and code lifetime to 180 days. Permissionless, works while frozen; keepers call it regularly (other calls extend the contract only when less than 3 days are left). Returns `Promise<void>`. |
-| `requote(selling, buying)` | Re-check both market assets against the price oracle and cache fresh prices for trading; the market record and the cache are rewritten only when they change (a call that would write nothing is not sent, the simulated record is returned). Permissionless, blocked while frozen. Returns `Promise<Market \| undefined>` with the updated record (`undefined` for an unknown pair). |
-| `subsidize(params)` | Open a market or extend its oracle price feeds access by burning exactly `amount` XRF from the sponsor (`params: SubsidizeArguments`). Returns `Promise<bigint[]>` with the new expiration timestamps. |
+| `requote(selling, buying)` | Re-check both market assets against the price oracle and cache fresh prices for trading; the market record and the cache are rewritten only when they change. When the simulation writes nothing (the market and the cached prices are current, or the oracle has no newer price), no transaction is submitted and the simulated record is returned. Permissionless, blocked while frozen. Returns `Promise<Market \| undefined>` with the updated record (`undefined` for an unknown pair). |
+| `subsidize(params)` | Extend the oracle price feeds access of a market, creating the market if it does not exist yet, by burning exactly `amount` XRF from the sponsor (`params: SubsidizeArguments`). Returns `Promise<bigint[]>` with the new expiration timestamps. |
 
 Standalone helper: `orderId(owner, nonce)` (see below).
 
 The safety admin entry points (`freeze`, `delegate`, `set_oracle`, `set_floor`) are not wrapped: they are operated
 outside the client.
 
-`cancel` and `update` fit about 110 orders per transaction; a trade matches at most 20 maker orders (`MAX_FILLS`), and
-each listed order the contract skips adds a `skip` event, so 20 fills leave room for 6 skipped orders.
+`cancel` and `update` process up to 100 orders per transaction; a trade matches at most 20 maker orders (`MAX_FILLS`),
+and each listed order the contract skips adds a `skip` event, so 20 fills leave room for 6 skipped orders.
 
 ### Markets and prices
 
 A `Limit` trade needs an open market for its pair: without one it fails with `AssetsNotVerifiedByOracle` (`721`).
 `Fill`/`FillOrKill` trades and `swap` only cross existing orders and need no market. A market is opened only by
-`subsidize({sponsor, selling, buying, amount})` (either asset order opens the same market), which requires at least one of the assets to be quoted by the price oracle:
+`subsidize({sponsor, selling, buying, amount})` (either asset order opens the same market), which requires at least one
+of the assets to be quoted by the price oracle:
 
 - On a pair without a market, `amount` must cover `Config.market_listing_fee` (`InvalidAmount`, `706`, otherwise). The
   fee is burned through an oracle `track` call, and whatever is left of `amount` through a second one (skipped when
@@ -96,8 +201,8 @@ A `Limit` trade needs an open market for its pair: without one it fails with `As
   `amount`.
 - On an existing market the whole `amount` extends the price feeds access of its quoted assets.
 
-The listing fee is not configured: the contract derives it from the oracle's daily fee as `daily_fee × 90` whenever
-the oracle is set, and `loadConfig()` returns it. The fee pays one `track` call split across the listed assets, so a pair
+The listing fee is not configured: the contract derives it from the oracle's daily fee as `daily_fee × 90` whenever the
+oracle is set, and `loadConfig()` returns it. The fee pays one `track` call split across the listed assets, so a pair
 with one listed asset gets 90 days of feed and a pair with both listed 45 days each.
 
 `buy`, `sell` and `update` never call the oracle. They value orders against the prices cached by `requote` and
@@ -107,11 +212,12 @@ either listed asset (missing or older than 72 hours) fails with `AssetPriceOracl
 
 ### Order expiration
 
-`buy`/`sell` take an optional `expires` UNIX timestamp in seconds (0 or omitted means no expiration). It applies to
-the order created for the remainder of a `Limit` trade and must be in the future (`InvalidExpiration`, `707`); other kinds ignore
-it. An expired order is invisible to `order()`, skipped by matching and treated as gone by `crossfill` (as the taker),
-but it can still be cancelled (removed by `update`), and `update` revives it when given an `expires` of 0 or in the future. Its id becomes
-free again, so a new order with the same nonce overwrites it. No event is emitted when an order expires.
+`buy`/`sell` take an optional `expires` UNIX timestamp in seconds (0 or omitted means no expiration). It applies to the
+order created for the remainder of a `Limit` trade and must be in the future (`InvalidExpiration`, `707`); other kinds
+ignore it. An expired order is invisible to `order()`, skipped by matching and treated as gone by `crossfill` (as the
+taker), but it can still be cancelled (removed by `update`), and `update` revives it when given an `expires` of 0 or in
+the future. Its id becomes free again, so a new order with the same nonce overwrites it. No event is emitted when an
+order expires.
 
 ### Allowances
 
@@ -122,8 +228,8 @@ order fills only when its maker's backing left covers the fill and the maker can
 or when the maker's transfer fails, it is skipped and left unchanged, and a `skip` event names it. Matching never
 removes, trims or caps an order.
 
-Pass `approve: {amount, liveUntil}` to `buy`, `sell` or `swap` to grant (or reset) the allowance on the selling asset
-as part of the same transaction (set `asset` to approve another token). `update` takes a separate
+Pass `approve: {amount, liveUntil}` to `buy`, `sell` or `swap` to grant (or reset) the allowance on the selling asset as
+part of the same transaction (set `asset` to approve another token). `update` takes a separate
 `approvals: [{asset, amount, liveUntil}]` list: each entry must name its asset, an asset without an entry keeps its
 current allowance, and a zero amount revokes. The amount is absolute, not a delta, so the signed authorization does not
 depend on ledger state; when several approvals name the same asset, the last one wins. `cancel` never moves tokens.
@@ -193,7 +299,7 @@ Token allowance granted to the contract as part of the call.
 | Property | Type | Description |
 |---|---|---|
 | `asset?` | `string` | Token the allowance is granted on: defaults to `selling` for `buy`, `sell` and `swap`, required in `update` approvals. |
-| `amount` | `bigint` | Absolute allowance amount (0 revokes). |
+| `amount` | `bigint` | Absolute allowance amount (0 revokes the approval). |
 | `liveUntil` | `number` | Ledger sequence the allowance lives until (at most ~180 days ahead). |
 
 #### `TradeArguments`
@@ -259,7 +365,7 @@ Arguments passed to `swap`.
 |---|---|---|
 | `trader` | `string` | Orders owner. |
 | `updates` | `OrderUpdate[]` | New amount, price and expiration per order id. |
-| `approvals?` | `Approval[]` | Allowances granted before the backing check, each naming its `asset`; assets without one keep their allowance. |
+| `approvals?` | `Approval[]` | Allowances granted before the backing check, each naming its `asset`; an asset without an approval keeps its current allowance. |
 
 #### `OrderUpdate`
 
@@ -323,7 +429,8 @@ Typed as `TradeContractEvent`, `SwapContractEvent`, `OrderCreatedContractEvent`,
 ### Contract errors
 
 Simulation failures caused by the contract are thrown as `Error` with `message` `Contract execution error: #<code>
-<name>` and a numeric `code` property. `ContractErrors` maps the codes:
+<name>` and a numeric `code` property. A transaction that passes simulation but fails on-chain throws an `Error` with
+the transaction `hash` property and the transaction result in its `message`. `ContractErrors` maps the codes:
 
 | Code | Name | Meaning |
 |---|---|---|
@@ -382,23 +489,24 @@ const {ticker} = await api.getTicker24h()
 
 | Method | Description |
 |---|---|
-| `quoteSell({sellingAsset, buyingAsset, amount, direct?})` | Best trade routes for selling a fixed amount of the source asset (strict send). Each hop lists the matched order ids and `worstPrice` (a trade limit that crosses every listed order). |
-| `quoteBuy({sellingAsset, buyingAsset, amount, direct?})` | Best trade routes for buying a fixed amount of the destination asset (strict receive). |
-| `getDepth({market, depth?})` | Order book depth aggregated into price buckets around the mid price (`depth` is the ± band %, 0–100, default 20). |
+| `quoteSell({sellingAsset, buyingAsset, amount, direct?})` | Best trade routes for selling a fixed amount of the source asset (strict send). Each hop lists the matched order ids and `worstPrice` (a trade limit that crosses every listed order). Throws `AxisApiError` if the server is not ready or there is not enough liquidity. |
+| `quoteBuy({sellingAsset, buyingAsset, amount, direct?})` | Best trade routes for buying a fixed amount of the destination asset (strict receive). Throws like `quoteSell`. |
+| `getDepth({market, depth?, step?, limit?})` | Order book depth around the mid price (`depth` is the ± band %, 0–100, default 20) in price levels on multiples of `step` (e.g. `"0.0005"`; 5 significant digits by default), `limit` levels per side (default 100). Bids are rounded down and asks up, so a level price crosses every order in it; `bestBid`/`bestAsk` are the exact best prices. |
 | `getCandles({market, from?, to?, resolution?, order?})` | OHLCVT candlestick data. `resolution` accepts seconds or an alias (`5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `12h`, `1d`, `3d`, `1w`, `2w`; default `auto`). |
 | `getTicker24h()` | 24-hour ticker statistics for every available market. |
 | `getMarkets({cursor?, limit?})` | List all active markets with pagination. |
 | `getContract()` | Contract state tracked by the indexer: `frozen`, `config` (`safetyAdmin`, `oracle`, `marketListingFee`, `minTradeSize`) and active `markets`. |
 | `getOrders({owner?, asset?, cursor?, limit?})` | Active orders, filterable by owner or asset (`asset` may be a string or string array). |
 | `getOrder(id)` | A single active order by ID (throws `AxisApiError` with status 404 if not found). |
+| `getAccount(address)` | Every live order of an account (not paginated) and its backing per traded token. |
 | `getOrderHistory({owner?, pair?, cursor?, limit?})` | Archived/historical orders (`pair` = `[base, quote]` contract ids). |
 | `getTrades({trader?, pair?, cursor?, limit?})` | Recent trades (`pair` = `[base, quote]` contract ids). |
 
 Assets accept Soroban contract id or classic asset string formats like `XLM`, `CODE:Issuer`, `CODE-Issuer`. Markets use
 `BASE/QUOTE` convention. Amounts are expressed in stroops on input and returned as strings. Order ids are decimal
 strings of the `u128` id; they are not sequential, so pagination uses the `cursor` field of the last received row.
-Orders carry `backed` (the amount the maker can actually deliver) and `backing` when the indexer tracks maker
-balances and allowances.
+Orders carry `backed` (the amount the maker can actually deliver) and `backing` when the indexer tracks maker balances
+and allowances.
 
 ### Error handling
 
@@ -420,9 +528,9 @@ try {
 Soroban RPC simulation records only the ledger entries the contract actually touched against the state at simulation
 time. The orderbook matching loop stops as soon as the taker is filled, and orders it skipped are recorded read-only
 without their makers' entries. If the book moves before the transaction lands - an order is partly filled, repriced back
-into range, its maker restores the backing, or an expired order is revived - the contract has to read and write entries
-that are missing from the footprint, resulting in a rejection. Likewise, a `Limit` trade that simulation filled in full
-may create an order for a remainder at apply time under an entry the simulation never saw.
+into range, its maker restores the backing, an earlier order shrinks, or an expired order is revived - the contract has
+to read and write entries that are missing from the footprint, resulting in a rejection. Likewise, a `Limit` trade that
+simulation filled in full may create an order for a remainder at apply time under an entry the simulation never saw.
 
 To make trading transactions resilient to such changes, `buy`, `sell`, `crossfill` and `swap` patch the simulated
 transaction before signing. Every order id passed in `orders` (plus the taker order id for `crossfill`, every path step
@@ -432,11 +540,11 @@ maker sells, the maker's allowance on it to the contract, and the balance of the
 entry for XLM, a trustline for a classic asset, the token's `Balance` entry for a contract address; the asset issuer has
 none). The client loads the listed orders and the token instances with one RPC `getLedgerEntries` call (the classic
 asset behind each token is cached per client) and adds entries in list order, orders first, while the footprint limits
-(200 read-write, 400 total) allow. Tokens that are not Stellar Asset Contracts get no maker entries: their storage
-layout is unknown. The declared instructions, write bytes and resource fee grow with every added entry; the surplus
-resource fee is refundable, but every declared read-write entry pays the write-entry fee, so routers should list only
-orders they expect to fill. `update` declares the updated order ids only. Pass `autoFootprint: false` to the
-constructor to opt out.
+(200 read-write, 400 total) allow. Tokens that are not Stellar Asset Contracts keep what the simulation recorded: their
+storage layout is unknown. The declared instructions, write bytes and resource fee grow with every added entry, and the
+disk read bytes with every added account or trustline entry the simulation did not read; the surplus resource fee is
+refundable, but every declared read-write entry pays the write-entry fee, so routers should list only orders they expect
+to fill. `update` declares the updated order ids only. Pass `autoFootprint: false` to the constructor to opt out.
 
 Order entries are keyed by the raw `u128` order id in persistent contract storage and hold a positional vector
 `[owner, selling, buying, amount, price, expires?]`. The helpers exported for custom pipelines:

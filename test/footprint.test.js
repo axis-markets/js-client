@@ -427,6 +427,8 @@ describe('completeFootprint', () => {
         const data = tx.simulation.transactionData.build()
         expect(data.resources.instructions).toBe(SIM_INSTRUCTIONS + ORDER_INSTRUCTIONS + MAKER_INSTRUCTIONS)
         expect(data.resources.writeBytes).toBe(SIM_WRITE_BYTES + ORDER_ENTRY_SIZE + 3 * MAKER_ENTRY_SIZE)
+        //the trustline and the account are read from disk when applied, the contract entries are not
+        expect(data.resources.diskReadBytes).toBe(2 * MAKER_ENTRY_SIZE)
         expect(data.resourceFee).toBe(BigInt(SIM_RESOURCE_FEE) + ORDER_RESOURCE_FEE + 3n * MAKER_ENTRY_RESOURCE_FEE + MAKER_RESOURCE_FEE)
         //orders and traded tokens are loaded in one request
         expect(server.requests).toHaveLength(1)
@@ -442,6 +444,8 @@ describe('completeFootprint', () => {
             encode(allowanceLedgerKey(CONTRACT_MAKER, XLM_TOKEN, DEX)),
             encode(balanceLedgerKey(CONTRACT_MAKER, USDC_TOKEN, USDC))
         ])
+        //token Balance entries are contract data, not disk reads
+        expect(tx.simulation.transactionData.build().resources.diskReadBytes).toBe(0)
     })
 
     test('adds no trustline for an issuer maker', async () => {
@@ -490,6 +494,15 @@ describe('completeFootprint', () => {
         const fp = footprintOf(tx)
         expect(fp.readOnly.map(encode)).toEqual([encode(instanceKey())])
         expect(fp.readWrite.map(encode)).toContain(encode(trustline(MAKER, USDC)))
+        //the promoted trustline was already counted by the simulation, only the account is a new disk read
+        expect(tx.simulation.transactionData.build().resources.diskReadBytes).toBe(MAKER_ENTRY_SIZE)
+    })
+
+    test('adds no disk reads for maker entries the simulation declared read-write', async () => {
+        const server = mockServer([orderEntry(1n, MAKER, USDC_TOKEN, XLM_TOKEN), ...tokenEntries()])
+        const tx = dexTx([instanceKey()], [orderLedgerKey(DEX, 1n), trustline(MAKER, USDC), allowanceLedgerKey(MAKER, USDC_TOKEN, DEX), accountEntryKey(MAKER)])
+        expect(await completeFootprint(tx, DEX, [1n], {server})).toEqual({orders: 0, makerEntries: 0})
+        expect(tx.simulation.transactionData.build().resources.diskReadBytes).toBe(0)
     })
 
     test('declares only the order entry of a missing order', async () => {

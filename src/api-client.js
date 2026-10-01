@@ -73,12 +73,13 @@ export class AxisApiClient {
     }
 
     /**
-     * Order book depth aggregated into price buckets around the mid price
+     * Order book depth around the mid price, aggregated into price levels on multiples of `step` (bids rounded down,
+     * asks up, so a level price crosses every order in it)
      * @param {DepthParams} params - Depth request parameters
      * @return {Promise<OrderbookDepth>} - Aggregated bids and asks
      */
-    async getDepth({market, depth}) {
-        return this.request('/depth', {market, depth})
+    async getDepth({market, depth, step, limit}) {
+        return this.request('/depth', {market, depth, step, limit})
     }
 
     /**
@@ -122,6 +123,16 @@ export class AxisApiClient {
      */
     async getOrders({owner, asset, cursor, limit} = {}) {
         return this.request('/order', {owner, asset, cursor, limit})
+    }
+
+    /**
+     * Account state tracked by the indexer: every live order of the trader (not paginated) and their backing in each
+     * asset they trade
+     * @param {string} address - Trader address
+     * @return {Promise<ApiAccount>}
+     */
+    async getAccount(address) {
+        return this.request(`/account/${encodeURIComponent(address)}`)
     }
 
     /**
@@ -231,12 +242,18 @@ export class AxisApiClient {
  * @typedef {{}} DepthParams
  * @property {string} market - Market identifier `BASE/QUOTE`
  * @property {number} [depth] - Percentage band (±) around the center price (0 < depth ≤ 100, default 20)
+ * @property {string} [step] - Price step of the levels, a decimal such as `"0.0005"` (5 significant digits of the mid
+ *   price by default)
+ * @property {number} [limit] - Price levels per side (default 100, max 500)
  */
 
 /**
  * @typedef {{}} OrderbookDepth
  * @property {number} ledger - Ledger sequence
  * @property {number} timestamp - UNIX timestamp (seconds)
+ * @property {string|null} step - Price step of the levels (null for an empty book)
+ * @property {string|null} bestBid - Exact best bid price, before the rounding to levels
+ * @property {string|null} bestAsk - Exact best ask price, before the rounding to levels
  * @property {Array<[string, string]>} bids - `[price, quantity]` pairs sorted descending by price
  * @property {Array<[string, string]>} asks - `[price, quantity]` pairs sorted ascending by price
  */
@@ -354,6 +371,38 @@ export class AxisApiClient {
  * @property {string} [created] - Creation timestamp (UTC)
  * @property {string} [updated] - Last update timestamp (UTC)
  * @property {string} [cursor] - Pagination cursor
+ */
+
+/**
+ * @typedef {{}} ApiOrderBacking - Maker backing in the order's selling asset
+ * @property {string} balance - Token balance
+ * @property {string} allowance - Allowance granted to the AXIS contract
+ * @property {number} liveUntil - Ledger sequence the allowance lives until
+ * @property {boolean} authorized - Whether the maker can send and receive the token
+ * @property {string} [updated] - Last load timestamp (UTC)
+ * @property {boolean} [pending] - A reload confirming the latest event is still due: the values may predate it
+ */
+
+/**
+ * @typedef {{}} ApiBacking - Tracked backing of an account in a token
+ * @property {string} owner - Account address
+ * @property {string} asset - Token contract id
+ * @property {string} balance - Token balance
+ * @property {string} allowance - Allowance granted to the AXIS contract
+ * @property {number} liveUntil - Ledger sequence the allowance lives until
+ * @property {boolean} authorized - Whether the account can send and receive the token
+ * @property {string} budget - Effective budget, min(balance, allowance), 0 when unauthorized or expired
+ * @property {string} [updated] - Last load timestamp (UTC)
+ * @property {string} [skipped] - Last `skip` event of an order selling the token (UTC)
+ * @property {boolean} [pending] - A reload confirming the latest event is still due
+ */
+
+/**
+ * @typedef {{}} ApiAccount - Account state: every live order and the backing per traded asset
+ * @property {string} address - Trader address
+ * @property {number} ledger - Last processed ledger
+ * @property {ApiOrder[]} orders - Live orders, oldest first
+ * @property {Object<string, ApiBacking>} backing - Backing by token contract id
  */
 
 /**

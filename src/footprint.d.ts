@@ -86,10 +86,13 @@ export interface FootprintOptions {
 
 /**
  * Complete the footprint of a simulated trading transaction so it still applies when the book moves between simulation
- * and execution: every listed order entry, and for every maker behind them the balance of the asset they sell, their
- * allowance on it to the DEX contract and the balance of the asset they receive, are declared read-write (orders first,
- * in list order, while the footprint limits allow). Tokens that are not Stellar Asset Contracts get no maker entries.
- * Patches the simulation data (footprint, resources, resource fee) in place and rebuilds `tx.built`.
+ * and execution (an order repriced back into range, a maker's backing restored, an earlier order shrunk): every listed
+ * order entry, and for every maker behind them the balance of the asset they sell, their allowance on it to the DEX
+ * contract and the balance of the asset they receive, are declared read-write (orders first, in list order, while the
+ * footprint limits allow). Makers of tokens that are not Stellar Asset Contracts keep what the simulation recorded
+ * (their storage layout is unknown).
+ * Patches the simulation data (footprint, resources including disk read bytes, resource fee) in place and rebuilds
+ * `tx.built`.
  * @param tx - Simulated `AssembledTransaction` from `@stellar/stellar-sdk/contract`
  * @param contractId - DEX contract address
  * @param orderIds - Order ids passed to the contract call

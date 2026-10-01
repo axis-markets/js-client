@@ -1,6 +1,6 @@
 import {Networks} from '@stellar/stellar-sdk'
 import ContractClient from '../src/contract-client.js'
-import {ContractErrors, processSimulationErrors} from '../src/errors.js'
+import {ContractErrors, processSimulationErrors, processTransactionErrors} from '../src/errors.js'
 
 const CONTRACT = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC'
 
@@ -41,5 +41,30 @@ describe('processSimulationErrors', () => {
         expect(() => processSimulationErrors(tx)).toThrow('HostError: Error(WasmVm, InvalidAction)')
         const unknownCode = {simulation: {error: 'HostError: Error(Contract, #999)'}}
         expect(() => processSimulationErrors(unknownCode)).toThrow('HostError: Error(Contract, #999)')
+    })
+})
+
+describe('processTransactionErrors', () => {
+    test('is a no-op for a successful transaction', () => {
+        expect(() => processTransactionErrors({getTransactionResponse: {status: 'SUCCESS', returnValue: {}}})).not.toThrow()
+    })
+
+    test('reports a transaction that failed on-chain with its hash and result', () => {
+        const sent = {
+            sendTransactionResponse: {status: 'PENDING', hash: 'abc123'},
+            getTransactionResponse: {
+                status: 'FAILED',
+                returnValue: undefined,
+                resultXdr: {result: {tx_failed: [{op_inner: {invoke_host_function: 'resource_limit_exceeded'}}]}}
+            }
+        }
+        let error
+        try {
+            processTransactionErrors(sent)
+        } catch (e) {
+            error = e
+        }
+        expect(error.message).toBe('Transaction abc123 failed: {"tx_failed":[{"op_inner":{"invoke_host_function":"resource_limit_exceeded"}}]}')
+        expect(error.hash).toBe('abc123')
     })
 })

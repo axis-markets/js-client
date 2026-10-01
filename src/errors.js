@@ -1,3 +1,5 @@
+import {contract} from '@stellar/stellar-sdk'
+
 /**
  * Standard contract errors
  */
@@ -23,7 +25,7 @@ export const ContractErrors = {
 
 /**
  * Handle simulation errors if any
- * @param {AssembledTransaction} tx
+ * @param {contract.AssembledTransaction} tx
  * @throws {Error} - Error with numeric `code` property for known contract errors
  * @internal
  */
@@ -41,4 +43,20 @@ export function processSimulationErrors(tx) {
         }
         throw tx.simulation.error
     }
+}
+
+/**
+ * Handle the failure of a transaction applied on-chain
+ * @param {contract.SentTransaction} sent
+ * @throws {Error} - Error with the transaction `hash` and its result
+ * @internal
+ */
+export function processTransactionErrors(sent) {
+    const response = sent.getTransactionResponse
+    if (response?.status !== 'FAILED')
+        return
+    const hash = sent.sendTransactionResponse?.hash
+    const error = new Error(`Transaction ${hash} failed: ${JSON.stringify(response.resultXdr?.result, (key, value) => typeof value === 'bigint' ? value.toString() : value)}`)
+    error.hash = hash
+    throw error
 }

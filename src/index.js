@@ -1,27 +1,21 @@
 import {Networks, contract, rpc} from '@stellar/stellar-sdk'
 import ContractClient from './contract-client.js'
-import {ContractErrors, processSimulationErrors} from './errors.js'
+import {ContractErrors, processSimulationErrors, processTransactionErrors} from './errors.js'
 import {AxisApiClient, AxisApiError} from './api-client.js'
 import {collectOrderIds, completeFootprint, ensureOrdersFootprint} from './footprint.js'
 import {orderId, generateNonce} from './order-id.js'
+import {OrderKind, TradeDirection} from './constants.js'
 
-export {ContractErrors, AxisApiClient, AxisApiError, orderId}
-
-/** Trading order type - instructions to contract how to execute the trade */
-export const OrderKind = {
-    /** Execute trade, create a limit order if not executed in full */
-    Limit: 1,
-    /** Execute trade without creating a limit order */
-    Fill: 2,
-    /** Execute trade, cancel if was not executed in full */
-    FillOrKill: 3
-}
-
-/** Trade direction instructions */
-export const TradeDirection = {
-    Sell: 1,
-    Buy: 2
-}
+export {ContractErrors, AxisApiClient, AxisApiError, orderId, OrderKind, TradeDirection}
+export {Axis, toWsUrl} from './axis.js'
+export {AxisMarket} from './axis-market.js'
+export {AxisAccount, parseApiOrder} from './axis-account.js'
+export {AxisStreamClient} from './stream-client.js'
+export {TokenBalance} from './token-balance.js'
+export {Emitter} from './emitter.js'
+export {planApproval, maxQuoteSpend, APPROVAL_TTL_LEDGERS, APPROVAL_RENEW_LEDGERS} from './allowance.js'
+export {canonicalPair, compareAssets, pairKey, invertPrice, invertTicker, PRICE_SCALE} from './asset-pair.js'
+export {parseApiDate} from './api-dates.js'
 
 /**
  * Smart contract client for trading with AXIS DEX
@@ -44,6 +38,14 @@ export class AxisContractClient {
         this.autoFootprint = params.autoFootprint !== false
         this.server = new rpc.Server(params.rpcUrl, {allowHttp: true})
         this.assetCache = new Map()
+    }
+
+    /**
+     * Account that signs and pays for the transactions
+     * @return {string}
+     */
+    get publicKey() {
+        return this.client.options.publicKey
     }
 
     /**
@@ -137,7 +139,7 @@ export class AxisContractClient {
         const tx = await this.client.update({trader: params.trader, updates, approvals}, {fee: this.fee})
         processSimulationErrors(tx)
         this.updateFootprint(tx, updates.map(update => update.id))
-        const {result} = await tx.signAndSend()
+        const result = await signAndSend(tx)
         return result
     }
 
@@ -148,7 +150,7 @@ export class AxisContractClient {
      * @return {Promise<void>}
      * @throws {Error} - If trader is not the owner of any existing order in `ids` or if the contract is frozen
      */
-    async cancel(ids, trader) {
+    async cancel(trader, ids) {
         await this.update({trader, updates: ids.map(id => ({id, amount: 0n, price: 0n}))})
     }
 
@@ -166,7 +168,7 @@ export class AxisContractClient {
         processSimulationErrors(tx)
         //the traded assets come from the taker order, resolved while completing the footprint
         await this.updateTradeFootprint(tx, [], [takerOrderId], orders)
-        const {result} = await tx.signAndSend()
+        const result = await signAndSend(tx)
         return [result[0], result[1], result[2]]
     }
 
@@ -190,7 +192,7 @@ export class AxisContractClient {
         processSimulationErrors(tx)
         const tokens = [params.selling, ...params.path.map(step => step.asset)]
         await this.updateTradeFootprint(tx, tokens, ...params.path.map(step => step.orders))
-        const {result} = await tx.signAndSend()
+        const result = await signAndSend(tx)
         return [result[0], result[1]]
     }
 
@@ -211,7 +213,7 @@ export class AxisContractClient {
         processSimulationErrors(tx)
         if (tx.isReadCall)
             return tx.result ?? undefined //nothing changed on-chain
-        const {result} = await tx.signAndSend()
+        const result = await signAndSend(tx)
         return result ?? undefined
     }
 
@@ -230,7 +232,7 @@ export class AxisContractClient {
             amount: params.amount
         }, {fee: this.fee})
         processSimulationErrors(tx)
-        const {result} = await tx.signAndSend()
+        const result = await signAndSend(tx)
         return result
     }
 
@@ -241,7 +243,7 @@ export class AxisContractClient {
     async keepalive() {
         const tx = await this.client.keepalive({fee: this.fee})
         processSimulationErrors(tx)
-        await tx.signAndSend()
+        await signAndSend(tx)
     }
 
     /**
@@ -287,6 +289,19 @@ function toApproval(approve, defaultAsset) {
     return {asset: approve.asset ?? defaultAsset, amount: approve.amount, live_until: approve.liveUntil}
 }
 
+/**
+ * Sign and submit a simulated transaction
+ * @param {contract.AssembledTransaction} tx
+ * @return {Promise<*>} - Parsed contract call result
+ * @throws {Error} - If the transaction failed on-chain
+ * @internal
+ */
+async function signAndSend(tx) {
+    const sent = await tx.signAndSend()
+    processTransactionErrors(sent)
+    return sent.result
+}
+
 async function execTrade(params, direction, context) {
     //the id of the order created for the remainder derives from the trader and this nonce; generated per call, never supplied by the caller
     const nonce = generateNonce()
@@ -308,7 +323,7 @@ async function execTrade(params, direction, context) {
     //the remainder of a Limit trade becomes an order under an id known in advance - declare it even if the simulation filled the quote
     const remainder = params.kind === OrderKind.Limit ? [orderId(params.trader, nonce)] : []
     await context.updateTradeFootprint(tx, [params.selling, params.buying], payload.orders, remainder)
-    const {result} = await tx.signAndSend()
+    const result = await signAndSend(tx)
     return [result[0], result[1], result[2] ?? undefined]
 }
 
@@ -424,7 +439,7 @@ async function execTrade(params, direction, context) {
 /**
  * @typedef {{}} Config - Contract configuration
  * @property {string} oracle - Oracle contract address
- * @property {bigint} market_listing_fee - Amount of oracle tokens burned by the market creator to provision the oracle price feeds (daily fee x 90 by default)
+ * @property {bigint} market_listing_fee - Amount of oracle tokens burned by the market creator to provision the oracle price feeds (always the oracle daily fee x 90)
  * @property {string} safety_admin - Address of the account allowed to freeze the contract, change the minimum trade size and replace the oracle
  * @property {bigint} min_trade_size - Minimum trade value in USD, with 7 decimals precision (0 disables the limit)
  */

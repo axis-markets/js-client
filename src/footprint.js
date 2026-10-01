@@ -1,4 +1,4 @@
-import {xdr, Address, Asset, Keypair, StrKey, TransactionBuilder, nativeToScVal, scValToNative} from '@stellar/stellar-sdk'
+import {xdr, Address, Asset, Keypair, StrKey, TransactionBuilder, nativeToScVal, scValToNative, contract, rpc} from '@stellar/stellar-sdk'
 
 /**
  * Upper bound of a serialized `Order` ledger entry in bytes.
@@ -45,6 +45,13 @@ export const MAKER_INSTRUCTIONS = 3_000_000
  * @type {bigint}
  */
 export const MAKER_RESOURCE_FEE = 20_000n
+
+/**
+ * Ledger entry types read from disk when a transaction is applied: every declared one counts towards the disk read
+ * bytes, whether the execution touches it or not.
+ * @type {Set<string>}
+ */
+const DISK_ENTRY_TYPES = new Set(['account', 'trustline'])
 
 /**
  * Network-wide per-transaction instructions limit.
@@ -244,21 +251,29 @@ export async function completeFootprint(tx, contractId, orderIds, {server, token
         }
     }
     const data = tx.simulation.transactionData
+    //entries promoted from the read-only part are already counted as disk reads by the simulation
+    const readOnly = new Set(data.getReadOnly().map(key => key.toXDR('base64')))
     const added = declareReadWrite(data, [...orderKeys, ...makerKeys])
     if (!added.length)
         return {orders: 0, makerEntries: 0}
     const makers = new Set()
     let makerEntries = 0
+    let diskEntries = 0
     for (const key of added) {
-        const maker = makerOf.get(key.toXDR('base64'))
+        const encoded = key.toXDR('base64')
+        const maker = makerOf.get(encoded)
         if (maker === undefined)
             continue
         makerEntries++
         makers.add(maker)
+        if (DISK_ENTRY_TYPES.has(key.type) && !readOnly.has(encoded)) {
+            diskEntries++
+        }
     }
     const orderEntries = added.length - makerEntries
     applyResources(tx, data, {
         instructions: orderEntries * ORDER_INSTRUCTIONS + makers.size * MAKER_INSTRUCTIONS,
+        diskReadBytes: diskEntries * MAKER_ENTRY_SIZE,
         writeBytes: orderEntries * ORDER_ENTRY_SIZE + makerEntries * MAKER_ENTRY_SIZE,
         fee: BigInt(orderEntries) * ORDER_RESOURCE_FEE + BigInt(makerEntries) * MAKER_ENTRY_RESOURCE_FEE + BigInt(makers.size) * MAKER_RESOURCE_FEE
     })
@@ -376,12 +391,12 @@ function declareReadWrite(data, keys) {
  * Declare the resources of the added entries and rebuild the transaction from the patched simulation data
  * @param {contract.AssembledTransaction} tx - Simulated transaction
  * @param {SorobanDataBuilder} data - Patched simulation data
- * @param {{instructions: number, writeBytes: number, fee: bigint}} extra - Resources and fee to add
+ * @param {{instructions: number, diskReadBytes?: number, writeBytes: number, fee: bigint}} extra - Resources and fee to add
  * @private
  */
-function applyResources(tx, data, {instructions, writeBytes, fee}) {
+function applyResources(tx, data, {instructions, diskReadBytes = 0, writeBytes, fee}) {
     const resources = data.build().resources
-    data.setResources(Math.min(resources.instructions + instructions, MAX_TX_INSTRUCTIONS), resources.diskReadBytes, resources.writeBytes + writeBytes)
+    data.setResources(Math.min(resources.instructions + instructions, MAX_TX_INSTRUCTIONS), resources.diskReadBytes + diskReadBytes, resources.writeBytes + writeBytes)
     data.setResourceFee((data.build().resourceFee + fee).toString())
 
     //drop cached simulation data so the SDK picks up the patched builder when signing
