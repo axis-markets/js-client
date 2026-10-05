@@ -260,6 +260,52 @@ describe('Axis', () => {
         axis.close()
     })
 
+    describe('contract address', () => {
+        const OTHER = 'CA6P26K4QNNIMTYP22ILTSCXQQDEKNWJIZJPC34YEZYOLBNT7YUPX7XS'
+
+        function createUnbound() {
+            return new Axis({apiUrl: 'http://aggregator.test', rpcUrl: 'http://rpc.test', networkPassphrase: 'Test SDF Network ; September 2015', WebSocket: MockWebSocket})
+        }
+
+        test('comes from the AXIS API when the option is not set', async () => {
+            mockFetch({'/contract': {...contractInfo, address: CONTRACT}})
+            const axis = createUnbound()
+            expect(axis.contractId).toBeUndefined()
+            expect(await axis.getContractId()).toBe(CONTRACT)
+            expect(axis.loaded).toBe(true)
+            expect(axis.tokenBalances.spender).toBe(CONTRACT)
+            axis.close()
+        })
+
+        test('fails the connection when the AXIS API does not report it', async () => {
+            mockFetch({'/contract': contractInfo})
+            const axis = createUnbound()
+            await expect(axis.connect()).rejects.toThrow('set the `contractId` option')
+            expect(axis.loaded).toBe(false)
+            axis.close()
+        })
+
+        test('fails the connection when the AXIS API tracks another contract', async () => {
+            mockFetch({'/contract': {...contractInfo, address: OTHER}})
+            const {axis} = createAxis()
+            await expect(axis.connect()).rejects.toThrow(`tracks contract ${OTHER}, not ${CONTRACT}`)
+            expect(axis.loaded).toBe(false)
+            axis.close()
+        })
+
+        test('ignores a pushed snapshot of another contract after connecting', async () => {
+            mockFetch({'/contract': {...contractInfo, address: CONTRACT}})
+            const {axis} = createAxis()
+            await axis.connect()
+            const socket = latestSocket()
+            socket.open()
+            socket.push({type: 'contract', topic: 'contract', kind: 'freeze', data: {...contractInfo, address: OTHER, frozen: true}})
+            expect(axis.frozen).toBe(false)
+            expect(axis.contractId).toBe(CONTRACT)
+            axis.close()
+        })
+    })
+
     test('tracks the ledger pushed with the contract state', async () => {
         mockFetch({'/contract': contractInfo})
         const {axis, tokens} = createAxis()

@@ -324,6 +324,7 @@ export class AxisApiClient {
 
 /**
  * @typedef {{}} ContractInfo - Contract state tracked by the indexer
+ * @property {string} address - AXIS contract address
  * @property {boolean} frozen - Whether trading is blocked by the safety admin
  * @property {ContractInfoConfig} [config] - Contract configuration
  * @property {ContractInfoMarket[]} markets - Markets opened by `subsidize`

@@ -89,7 +89,8 @@ export class AxisMarket {
      * @return {Promise<Market|undefined>}
      */
     async requote(signer) {
-        return this.axis.contractClient(signer).requote(this.base, this.quote)
+        const client = await this.axis.contractClient(signer)
+        return client.requote(this.base, this.quote)
     }
 
     /**
@@ -98,7 +99,7 @@ export class AxisMarket {
      * @return {Promise<bigint[]>} - New access expiration UNIX timestamps (in seconds) for each oracle-listed asset
      */
     async subsidize({amount, sponsor, signer}) {
-        const client = this.axis.contractClient(signer)
+        const client = await this.axis.contractClient(signer)
         return client.subsidize({sponsor: sponsor ?? client.publicKey, selling: this.base, buying: this.quote, amount})
     }
 

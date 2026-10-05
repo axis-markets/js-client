@@ -685,6 +685,8 @@ export interface ContractInfoMarket {
 
 /** Contract state tracked by the indexer */
 export interface ContractInfo {
+    /** AXIS contract address */
+    address: string;
     /** Whether trading is blocked by the safety admin */
     frozen: boolean;
     /** Contract configuration */
@@ -1206,8 +1208,8 @@ export interface Signer {
 export interface AxisOptions {
     /** AXIS REST API URL */
     apiUrl: string;
-    /** AXIS contract address */
-    contractId: string;
+    /** AXIS contract address, the one reported by the AXIS API by default (when set, a different address reported by the API fails `connect()`) */
+    contractId?: string;
     /** AXIS API push channel URL (`<apiUrl>/ws` with the `ws(s)` scheme by default) */
     wsUrl?: string;
     /** Stellar RPC URL */
@@ -1240,6 +1242,8 @@ export declare class Axis extends Emitter {
 
     /** AXIS REST API client */
     readonly api: AxisApiClient;
+    /** AXIS contract address, from the `contractId` option or reported by the AXIS API on `connect()` */
+    readonly contractId: string | undefined;
     /** AXIS API WebSocket client */
     readonly stream: AxisStreamClient;
     /** Token balance wrappers */
@@ -1263,6 +1267,8 @@ export declare class Axis extends Emitter {
 
     /** Load the contract state and track its changes */
     connect(): Promise<Axis>;
+    /** AXIS contract address, connecting to the AXIS API first when the `contractId` option was not set */
+    getContractId(): Promise<string>;
     /** Current ledger sequence */
     getLedger(): Promise<number>;
     /**

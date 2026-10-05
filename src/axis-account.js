@@ -272,7 +272,8 @@ export class AxisAccount extends Emitter {
      */
     async estimateSell(params) {
         const {payload} = await this.prepareTrade(TradeDirection.Sell, params)
-        return this.client().estimateSell(payload)
+        const client = await this.client()
+        return client.estimateSell(payload)
     }
 
     /**
@@ -282,7 +283,8 @@ export class AxisAccount extends Emitter {
      */
     async estimateBuy(params) {
         const {payload} = await this.prepareTrade(TradeDirection.Buy, params)
-        return this.client().estimateBuy(payload)
+        const client = await this.client()
+        return client.estimateBuy(payload)
     }
 
     /**
@@ -323,7 +325,7 @@ export class AxisAccount extends Emitter {
                 approvals.push({asset, ...approve})
             }
         }
-        const client = this.client()
+        const client = await this.client()
         const res = []
         for (let i = 0; i < normalized.length; i += UPDATE_BATCH) {
             const batch = normalized.slice(i, i + UPDATE_BATCH).map(n => n.update)
@@ -340,7 +342,7 @@ export class AxisAccount extends Emitter {
      * @return {Promise<void>}
      */
     async cancel(ids) {
-        const client = this.client()
+        const client = await this.client()
         const all = ids.map(id => BigInt(id))
         for (let i = 0; i < all.length; i += UPDATE_BATCH) {
             await client.cancel(this.address, all.slice(i, i + UPDATE_BATCH))
@@ -377,7 +379,8 @@ export class AxisAccount extends Emitter {
                 throw new Error(`Order ${takerOrderId} not found`)
             orders = (await this.findQuote(TradeDirection.Sell, taker.selling, taker.buying, taker.amount)).orders
         }
-        const [sold, bought, surplus] = await this.client().crossfill(this.address, BigInt(takerOrderId), orders.map(id => BigInt(id)))
+        const client = await this.client()
+        const [sold, bought, surplus] = await client.crossfill(this.address, BigInt(takerOrderId), orders.map(id => BigInt(id)))
         return {sold, bought, surplus}
     }
 
@@ -409,7 +412,8 @@ export class AxisAccount extends Emitter {
         if (approve) {
             this.emit('approve', {asset: selling, ...approve})
         }
-        const [sold, bought] = await this.client().swap({
+        const client = await this.client()
+        const [sold, bought] = await client.swap({
             direction,
             trader: this.address,
             selling,
@@ -438,6 +442,7 @@ export class AxisAccount extends Emitter {
             const {tokenBalances} = this.axis
             if (!tokenBalances)
                 throw new Error(`The allowance of ${this.address} in ${asset} is not tracked: set the \`rpcUrl\` option to read it`)
+            await this.axis.getContractId() //the allowance spender
             allowance = await tokenBalances.getAllowance(asset, this.address).catch(() => 0n) //unknown: a redundant approval, never a shortfall
         }
         return planApproval({
@@ -480,7 +485,7 @@ export class AxisAccount extends Emitter {
         if (planned && approve) {
             this.emit('approve', {asset: selling, ...approve})
         }
-        const client = this.client()
+        const client = await this.client()
         const [sold, bought, createdId] = direction === TradeDirection.Buy ?
             await client.buy(payload) :
             await client.sell(payload)
@@ -554,7 +559,8 @@ export class AxisAccount extends Emitter {
             return this.orders.get(key) //already reported
         let stored
         try {
-            stored = await this.client().order(id)
+            const client = await this.client()
+            stored = await client.order(id)
         } catch (e) {
             //estimate below
         }
@@ -627,10 +633,10 @@ export class AxisAccount extends Emitter {
     }
 
     /**
-     * @return {AxisContractClient}
+     * @return {Promise<AxisContractClient>}
      * @private
      */
-    client() {
+    async client() {
         if (!this.signTransaction)
             throw new Error(`No signTransaction callback for ${this.address}: pass it to axis.account()`)
         return this.axis.contractClient({publicKey: this.address, signTransaction: this.signTransaction})

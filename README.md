@@ -36,16 +36,15 @@ import {Axis, TradeDirection} from '@axis-markets/client'
 
 //testnet token contracts
 const XLM = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC'
-const USDC = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA' //USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
+const USDC = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
 const EURC = 'CCUUDM434BMZMYWYDITHFXHDMIVTGGD6T2I5UKNX5BSLXLW7HVR4MCGZ'
 
 const axis = new Axis({
     apiUrl: 'https://demo-api.axis.markets',
     rpcUrl: 'https://soroban-testnet.stellar.org',
-    contractId: 'CBJ747MKAGQO2LMJPOTCOONAWBLIIBSLOQE325R457TE5MIS6RTDJ4DC',
     networkPassphrase: 'Test SDF Network ; September 2015'
 })
-await axis.connect()
+await axis.connect() // the contract address comes from the AXIS API
 axis.on('frozen', frozen => console.log('trading', frozen ? 'suspended' : 'resumed'))
 
 const market = axis.getMarket(XLM, USDC) // either order: market.base / market.quote are in the contract order
@@ -92,6 +91,7 @@ selling the token oldest first), `backedPct` and `backingPending`.
 | `Axis` | Description |
 |---|---|
 | `connect()` | Load the contract state and follow its changes. |
+| `contractId`, `getContractId()` | AXIS contract address. |
 | `ledger`, `getLedger()` | Last ledger pushed by the AXIS API; current ledger (pushed, or RPC when stale). |
 | `frozen`, `config`, `markets`, `loaded` | Contract state; `markets` is a `Map` of `AxisMarket` by canonical key. |
 | `getMarket(x, y)` | Market of the asset pair in either order, `undefined` if not open. |
@@ -552,7 +552,7 @@ const {ticker} = await api.getTicker24h()
 | `getCandles({market, from?, to?, resolution?, order?})` | OHLCVT candlestick data. `resolution` accepts seconds or an alias (`5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `12h`, `1d`, `3d`, `1w`, `2w`; default `auto`). |
 | `getTicker24h()` | 24-hour ticker statistics for every available market. |
 | `getMarkets({cursor?, limit?})` | Pairs with orders on the book, with pagination (cached for up to 30 minutes). Markets opened on-chain come from `getContract()`. |
-| `getContract()` | Contract state tracked by the indexer: `frozen`, `config` (`safetyAdmin`, `oracle`, `listingMinDays`, `marketListingFee`, `minTradeSize`, `ledgerTime`) and active `markets` (`base`, `quote`, `created`, `refreshed`). |
+| `getContract()` | Contract state tracked by the indexer: contract `address`, `frozen`, `config` (`safetyAdmin`, `oracle`, `listingMinDays`, `marketListingFee`, `minTradeSize`, `ledgerTime`) and active `markets` (`base`, `quote`, `created`, `refreshed`). |
 | `getOrders({owner?, asset?, cursor?, limit?})` | Active orders, filterable by owner or asset (`asset` may be a string or string array). |
 | `getOrder(id)` | A single active order by ID (throws `AxisApiError` with status 404 if not found). |
 | `getAccount(address)` | Every live order of an account (not paginated) and its backing per traded token. |

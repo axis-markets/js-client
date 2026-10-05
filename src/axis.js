@@ -29,8 +29,6 @@ export class Axis extends Emitter {
      */
     constructor({apiUrl, wsUrl, rpcUrl, contractId, networkPassphrase = Networks.PUBLIC, fee, signer, WebSocket, fallbackPollInterval = 15_000}) {
         super()
-        if (!contractId)
-            throw new TypeError('AXIS contract id is required')
         this.api = new AxisApiClient(apiUrl)
         this.stream = new AxisStreamClient(wsUrl || toWsUrl(this.api.serverUrl), {WebSocket})
         this.rpcUrl = rpcUrl
@@ -57,6 +55,12 @@ export class Axis extends Emitter {
      * @readonly
      */
     api
+    /**
+     * AXIS contract address
+     * @type {string|undefined}
+     * @readonly
+     */
+    contractId
     /**
      * AXIS API WebSocket client
      * @type {AxisStreamClient}
@@ -148,12 +152,24 @@ export class Axis extends Emitter {
                         resolve(this)
                     }
                 }
+                const fail = e => {
+                    if (!settled) {
+                        settled = true
+                        this.connecting = undefined
+                        this.unsubscribeContract?.()
+                        reject(e)
+                    }
+                }
                 this.unsubscribeContract = this.stream.subscribe('contract', {}, message => {
                     if (message.ledger) {
                         this.applyLedger(message.ledger)
                     }
                     if (message.type === 'contract') {
-                        this.applyContractSnapshot(message.data)
+                        try {
+                            this.applyContractSnapshot(message.data)
+                        } catch (e) {
+                            return fail(e) //a snapshot of another contract is ignored after connecting
+                        }
                         done()
                     }
                 })
@@ -164,19 +180,27 @@ export class Axis extends Emitter {
                             this.applyContractSnapshot(data)
                         }
                         done()
-                    })
-                    .catch(e => {
+                    }, e => {
                         if (!settled && !this.stream.connected) {
                             this.startFallback()
-                            settled = true
-                            this.connecting = undefined
-                            this.unsubscribeContract?.()
-                            reject(e)
+                            fail(e)
                         }
                     })
+                    .catch(fail)
             })
         }
         return this.connecting
+    }
+
+    /**
+     * AXIS contract address
+     * @return {Promise<string>}
+     */
+    async getContractId() {
+        if (!this.contractId) {
+            await this.connect()
+        }
+        return this.contractId
     }
 
     /**
@@ -266,7 +290,8 @@ export class Axis extends Emitter {
      * @return {Promise<number>} - Ledger sequence both entries live until, at least
      */
     async keepalive({days, signer} = {}) {
-        return this.contractClient(signer).keepalive(days)
+        const client = await this.contractClient(signer)
+        return client.keepalive(days)
     }
 
     /**
@@ -285,14 +310,15 @@ export class Axis extends Emitter {
     /**
      * Contract client signing with the given account
      * @param {Signer} [signer] - The default signer if omitted
-     * @return {AxisContractClient}
+     * @return {Promise<AxisContractClient>}
      * @internal
      */
-    contractClient(signer = this.signer) {
+    async contractClient(signer = this.signer) {
         if (!signer?.publicKey || !signer.signTransaction)
             throw new Error('A signer ({publicKey, signTransaction}) is required to submit transactions')
         if (!this.rpcUrl)
             throw new Error('The `rpcUrl` option is required to submit transactions')
+        await this.getContractId()
         const cached = this.clients.get(signer.publicKey)
         if (cached && cached.signTransaction === signer.signTransaction)
             return cached.client
@@ -324,6 +350,7 @@ export class Axis extends Emitter {
      * @private
      */
     applyContractSnapshot(data) {
+        this.checkContractAddress(data.address)
         this.loadedAt = Date.now()
         const frozen = data.frozen === true
         if (frozen !== this.frozen) {
@@ -347,6 +374,35 @@ export class Axis extends Emitter {
             }
         }
         this.emit('change')
+    }
+
+    /**
+     * Take the contract address reported by the AXIS API, or check it against the explicitly set
+     * @param {string} [address]
+     * @throws {Error} - If the API tracks another contract or the address is unknown
+     * @private
+     */
+    checkContractAddress(address) {
+        if (!address) {
+            if (!this.contractId)
+                throw new Error('The AXIS API does not report the contract address: set the `contractId` option')
+            return
+        }
+        if (!this.contractId) {
+            this.setContractId(address)
+        } else if (address !== this.contractId)
+            throw new Error(`The AXIS API tracks contract ${address}, not ${this.contractId}`)
+    }
+
+    /**
+     * @param {string} contractId
+     * @private
+     */
+    setContractId(contractId) {
+        this.contractId = contractId
+        if (this.tokenBalances) {
+            this.tokenBalances.spender = contractId
+        }
     }
 
     /**
@@ -398,7 +454,7 @@ export function toWsUrl(apiUrl) {
 /**
  * @typedef {{}} AxisOptions
  * @property {string} apiUrl - AXIS REST API URL
- * @property {string} contractId - AXIS contract address
+ * @property {string} [contractId] - AXIS contract address, by default pulled from the AXIS API
  * @property {string} [wsUrl] - AXIS API push channel URL (`<apiUrl>/ws` with the `ws(s)` scheme by default)
  * @property {string} [rpcUrl] - Stellar RPC URL
  * @property {string} [networkPassphrase] - Network passphrase (Pubnet by default)
