@@ -1,6 +1,6 @@
 {
   "name": "@axis-markets/client",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "description": "AXIS contract and API client",
   "author": "team@stellar.expert",
   "license": "MIT",

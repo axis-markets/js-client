@@ -4,8 +4,8 @@ import {parseApiDate} from './api-dates.js'
 import {planApproval, maxQuoteSpend} from './allowance.js'
 import {OrderKind, TradeDirection} from './constants.js'
 
-/** Orders per `update` transaction (contract limit) */
-const UPDATE_BATCH = 100
+/** Orders per `update` transaction  */
+const UPDATE_BATCH = 90
 /** Time to wait for the account state before trading, in milliseconds */
 const READY_TIMEOUT = 15_000
 /** How long an order created by this client counts as committed before the indexer reports it, in milliseconds */

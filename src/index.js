@@ -148,7 +148,7 @@ export class AxisContractClient {
      * Orders that no longer exist are skipped; expired orders revived with the new expiration.
      * A zero amount removes the order, expired ones included. An updated order's entry lifetime is extended to cover its expiration +1 day.
      * Approvals and removals work in a frozen contract and on a market without quoted assets.
-     * A transaction can process up to 100 orders in one batch.
+     * A transaction can process up to 90 orders in one batch.
      * @param {UpdateArguments} params
      * @return {Promise<bigint[]>} - IDs of the orders to update
      * @throws {Error} - If the trader does not own an updated order, if order parameters are invalid, if an order is below the minimum value,
@@ -174,7 +174,7 @@ export class AxisContractClient {
     }
 
     /**
-     * Cancel existing orders, expired ones included. A transaction can process up to 100 orders in one batch.
+     * Cancel existing orders, expired ones included. A transaction can process up to 90 orders in one batch.
      * @param {string} trader - Trader address
      * @param {bigint[]} ids - IDs of the orders to cancel (non-existent orders are ignored)
      * @return {Promise<void>}

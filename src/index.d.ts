@@ -395,7 +395,7 @@ export declare class AxisContractClient {
     getMarket(selling: string, buying: string): Promise<Market | undefined>;
 
     /**
-     * Cancel existing orders, expired ones included. A transaction can process up to 100 orders in one batch.
+     * Cancel existing orders, expired ones included. A transaction can process up to 90 orders in one batch.
      * @param trader - Trader address
      * @param ids - IDs of the orders to cancel (non-existent orders are ignored)
      * @throws If trader is not the owner of any existing order in `ids` (works while the contract is frozen)
@@ -407,7 +407,7 @@ export declare class AxisContractClient {
      * Orders that no longer exist are skipped; expired orders revived with the new expiration.
      * A zero amount removes the order, expired ones included. An updated order's entry lifetime is extended to cover its expiration +1 day.
      * Approvals and removals work in a frozen contract and on a market without quoted assets.
-     * A transaction can process up to 100 orders in one batch.
+     * A transaction can process up to 90 orders in one batch.
      * @returns IDs of the orders to update
      * @throws If the trader does not own an updated order, if order parameters are invalid, if an order is below the minimum value,
      * if the new amounts are not backed by the trader's balance and allowance, an update changes an order on the frozen or not-quoted market
