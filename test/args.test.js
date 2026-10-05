@@ -1,4 +1,4 @@
-import {Networks, xdr, nativeToScVal, scValToNative} from '@stellar/stellar-sdk'
+import {Account, Contract, Keypair, Networks, SorobanDataBuilder, TransactionBuilder, xdr, nativeToScVal, scValToNative} from '@stellar/stellar-sdk'
 import ContractClient from '../src/contract-client.js'
 import {AxisContractClient, OrderKind, TradeDirection, orderId} from '../src/index.js'
 
@@ -31,7 +31,7 @@ function tradePayload(overrides = {}) {
 }
 
 //safety admin entry points, never invoked through the client
-const ADMIN = ['freeze', 'delegate', 'set_oracle', 'set_floor']
+const ADMIN = ['freeze', 'delegate', 'set_oracle', 'set_floor', 'set_listing_min_days', 'set_ledger_time']
 //client methods wrapping a contract function under another name
 const RENAMED = {loadConfig: 'config', isFrozen: 'frozen', getMarket: 'market'}
 const contractName = name => RENAMED[name] ?? name
@@ -47,7 +47,8 @@ describe('contract entry points', () => {
 
     test('the client exposes no method the contract spec lacks', () => {
         //`cancel` is sugar over `update`, the contract has no such function; `publicKey` is the signing account
-        const clientOnly = ['constructor', 'updateFootprint', 'updateTradeFootprint', 'buy', 'sell', 'cancel', 'publicKey']
+        //`keepalive` sends RestoreFootprint and ExtendFootprintTTL operations (with the ledger time of the config), the contract has no such entry point
+        const clientOnly = ['constructor', 'updateFootprint', 'updateTradeFootprint', 'buy', 'sell', 'estimateBuy', 'estimateSell', 'cancel', 'keepalive', 'submitFootprintOperation', 'loadLedgerTime', 'publicKey']
         const fromSpec = client.spec.funcs().map(fn => fn.name.toString())
         const exposed = Object.getOwnPropertyNames(AxisContractClient.prototype).filter(name => !clientOnly.includes(name))
         expect(exposed.filter(name => !fromSpec.includes(contractName(name)))).toEqual([])
@@ -142,13 +143,13 @@ describe('AxisContractClient argument mapping', () => {
             }
         }
         const footprints = []
-        const tokens = []
+        const settlements = []
         axis.updateFootprint = (tx, ...idLists) => footprints.push(idLists)
-        axis.updateTradeFootprint = async (tx, traded, ...idLists) => {
-            tokens.push(traded)
+        axis.updateTradeFootprint = async (tx, settlement, ...idLists) => {
+            settlements.push(settlement)
             footprints.push(idLists)
         }
-        return {calls, footprints, tokens}
+        return {calls, footprints, settlements}
     }
 
     function makeClient() {
@@ -157,7 +158,7 @@ describe('AxisContractClient argument mapping', () => {
 
     test('sell generates a nonce, passes the expiration, maps the approval and pre-declares the remainder order', async () => {
         const axis = makeClient()
-        const {calls, footprints, tokens} = stub(axis, 'trade', [10n, 20n, 42n])
+        const {calls, footprints, settlements} = stub(axis, 'trade', [10n, 20n, 42n])
         const res = await axis.sell({
             kind: OrderKind.Limit, trader: TRADER, amount: 10n, selling: ASSET_A, buying: ASSET_B, price: 10n ** 18n,
             orders: [1n], expires: 1_900_000_000, approve: {amount: 1000n, liveUntil: 777}
@@ -171,8 +172,8 @@ describe('AxisContractClient argument mapping', () => {
         //the approval defaults to the selling asset
         expect(args.approve).toEqual({asset: ASSET_A, amount: 1000n, live_until: 777})
         expect(footprints[0]).toEqual([[1n], [orderId(TRADER, args.nonce)]])
-        //the traded tokens are resolved together with the listed orders
-        expect(tokens[0]).toEqual([ASSET_A, ASSET_B])
+        //the traded tokens are resolved together with the listed orders, the bought one passes through the contract
+        expect(settlements[0]).toEqual({tokens: [ASSET_A, ASSET_B], passThrough: [ASSET_B], receiver: TRADER, bought: ASSET_B})
     })
 
     test('buy generates its own nonce, ignores a supplied one and skips the remainder for Fill trades', async () => {
@@ -204,17 +205,17 @@ describe('AxisContractClient argument mapping', () => {
 
     test('crossfill returns the profit and declares the taker and maker orders', async () => {
         const axis = makeClient()
-        const {calls, footprints, tokens} = stub(axis, 'crossfill', [5n, 7n, 1n])
+        const {calls, footprints, settlements} = stub(axis, 'crossfill', [5n, 7n, 1n])
         expect(await axis.crossfill(TRADER, 9n, [1n, 2n])).toEqual([5n, 7n, 1n])
         expect(calls[0].args).toEqual({trader: TRADER, taker_order_id: 9n, orders: [1n, 2n]})
         expect(footprints[0]).toEqual([[9n], [1n, 2n]])
-        //the pair comes from the taker order
-        expect(tokens[0]).toEqual([])
+        //the pair comes from the taker order, the surplus goes to the trader
+        expect(settlements[0]).toEqual({takerOrder: 9n, receiver: TRADER})
     })
 
     test('swap maps camelCase amounts and the approval', async () => {
         const axis = makeClient()
-        const {calls, footprints, tokens} = stub(axis, 'swap', [5n, 7n])
+        const {calls, footprints, settlements} = stub(axis, 'swap', [5n, 7n])
         const res = await axis.swap({
             direction: TradeDirection.Buy, trader: TRADER, selling: ASSET_A, sellingAmount: 100n, buyingAmount: 90n,
             path: [{asset: ASSET_B, orders: [3n]}], approve: {amount: 100n, liveUntil: 1}
@@ -225,7 +226,7 @@ describe('AxisContractClient argument mapping', () => {
             path: [{asset: ASSET_B, orders: [3n]}], approve: {asset: ASSET_A, amount: 100n, live_until: 1}
         })
         expect(footprints[0]).toEqual([[3n]])
-        expect(tokens[0]).toEqual([ASSET_A, ASSET_B])
+        expect(settlements[0]).toEqual({tokens: [ASSET_A, ASSET_B], passThrough: [ASSET_B], receiver: TRADER, bought: ASSET_B})
     })
 
     test('an explicit approval asset is kept', async () => {
@@ -299,7 +300,7 @@ describe('AxisContractClient argument mapping', () => {
 
     test('loadConfig, isFrozen and getMarket read the config, frozen and market views', async () => {
         const axis = makeClient()
-        const config = {oracle: ASSET_A, market_listing_fee: 90n, safety_admin: TRADER, min_trade_size: 0n}
+        const config = {oracle: ASSET_A, listing_min_days: 90, market_listing_fee: 90n, safety_admin: TRADER, min_trade_size: 0n, ledger_time: 5}
         const markets = []
         axis.client.config = async () => ({simulation: {}, result: config})
         axis.client.frozen = async () => ({simulation: {}, result: false})
@@ -322,8 +323,8 @@ describe('AxisContractClient argument mapping', () => {
     test('requote returns the updated market record', async () => {
         const axis = makeClient()
         const market = {
-            a: {asset: ASSET_A, listed: true, decimals: 7},
-            b: {asset: ASSET_B, listed: false, decimals: 0},
+            base: {asset: ASSET_A, listed: true, decimals: 7},
+            quote: {asset: ASSET_B, listed: false, decimals: 0},
             created: 1n
         }
         const requote = stub(axis, 'requote', market)
@@ -333,7 +334,7 @@ describe('AxisContractClient argument mapping', () => {
 
     test('requote returns the simulated record without sending when nothing changes', async () => {
         const axis = makeClient()
-        const market = {a: {asset: ASSET_A, listed: true, decimals: 7}, b: {asset: ASSET_B, listed: true, decimals: 7}, created: 1n}
+        const market = {base: {asset: ASSET_A, listed: true, decimals: 7}, quote: {asset: ASSET_B, listed: true, decimals: 7}, created: 1n}
         axis.client.requote = async () => ({
             simulation: {},
             isReadCall: true,
@@ -343,5 +344,161 @@ describe('AxisContractClient argument mapping', () => {
             }
         })
         expect(await axis.requote(ASSET_A, ASSET_B)).toEqual(market)
+    })
+
+})
+
+describe('AxisContractClient.keepalive', () => {
+    const keeper = Keypair.random()
+    const WASM_HASH = Buffer.alloc(32, 7)
+
+    const instanceKey = new Contract(CONTRACT).getFootprint()
+    const codeKey = xdr.LedgerKey.contractCode(new xdr.LedgerKeyContractCode({hash: WASM_HASH}))
+    const base64 = keys => keys.map(key => key.toXDR('base64'))
+
+    /** Client with a stubbed RPC server and a keypair signer, recording what is signed and sent */
+    function setup({simulation, sendStatus = 'PENDING', resultStatus = 'SUCCESS', executable = {wasmHash: WASM_HASH}, ledgerTime = 5,
+                       instanceLiveUntil = 5000, codeLiveUntil = 5000} = {}) {
+        const signed = []
+        const axis = new AxisContractClient({
+            publicKey: keeper.publicKey(),
+            contractId: CONTRACT,
+            rpcUrl: 'http://localhost',
+            networkPassphrase: Networks.TESTNET,
+            signTransaction: async (txXdr, opts) => {
+                const tx = TransactionBuilder.fromXDR(txXdr, opts.networkPassphrase)
+                tx.sign(keeper)
+                signed.push({tx, opts})
+                return {signedTxXdr: tx.toXDR()}
+            }
+        })
+        const calls = {sent: [], keys: []}
+        //days are converted with the ledger close time of the contract configuration
+        axis.client.config = async () => ledgerTime instanceof Error ?
+            {simulation: {error: ledgerTime.message}} :
+            {simulation: {}, result: {ledger_time: ledgerTime}}
+        axis.server = {
+            getLedgerEntries: async (...keys) => {
+                calls.keys.push(...keys)
+                const isInstance = keys[0].toXDR('base64') === instanceKey.toXDR('base64')
+                const entry = isInstance ?
+                    {val: {contractData: {val: {instance: {executable}}}}, liveUntilLedgerSeq: instanceLiveUntil} :
+                    {val: {contractCode: {}}, liveUntilLedgerSeq: codeLiveUntil}
+                //an evicted entry the RPC does not serve comes back as no entry at all
+                return {latestLedger: 1000, entries: entry.liveUntilLedgerSeq === null ? [] : [entry]}
+            },
+            getAccount: async address => new Account(address, '41'),
+            //like RPC, the simulation returns the footprint the operation needs
+            simulateTransaction: async tx => simulation ?? {
+                _parsed: true,
+                latestLedger: 1000,
+                minResourceFee: '62000000',
+                transactionData: new SorobanDataBuilder(tx.toEnvelope().value.tx.ext.value.toXDR('base64')).setResourceFee(62_000_000),
+                events: []
+            },
+            sendTransaction: async tx => {
+                calls.sent.push(tx)
+                return {status: sendStatus, hash: 'ab'.repeat(32)}
+            },
+            pollTransaction: async () => ({status: resultStatus})
+        }
+        return {axis, signed, calls}
+    }
+
+    test('extends the contract instance and its Wasm code with an ExtendFootprintTTL operation', async () => {
+        const {axis, signed, calls} = setup()
+        const liveUntil = await axis.keepalive()
+        expect(liveUntil).toBe(1000 + 30 * 17_280)
+        expect(base64(calls.keys)).toEqual(base64([instanceKey, codeKey]))
+        const [{tx, opts}] = signed
+        expect(opts).toEqual({networkPassphrase: Networks.TESTNET, address: keeper.publicKey()})
+        expect(tx.operations).toHaveLength(1)
+        expect(tx.operations[0]).toMatchObject({type: 'extendFootprintTtl', extendTo: 30 * 17_280})
+        //both entries in the read-only footprint, nothing written
+        const {readOnly, readWrite} = tx.toEnvelope().value.tx.ext.value.resources.footprint
+        expect(base64(readOnly)).toEqual(base64([instanceKey, codeKey]))
+        expect(readWrite).toEqual([])
+        //the resource fee counted once on top of the inclusion fee bid
+        expect(tx.fee).toBe(String(100_000 + 62_000_000))
+        expect(calls.sent).toHaveLength(1)
+        expect(calls.sent[0].signatures).toHaveLength(1)
+    })
+
+    test('takes the lifetime in days', async () => {
+        const {axis, signed} = setup()
+        expect(await axis.keepalive(90)).toBe(1000 + 90 * 17_280)
+        expect(signed[0].tx.operations[0].extendTo).toBe(90 * 17_280)
+        await expect(axis.keepalive(0)).rejects.toThrow('Invalid keepalive days')
+        await expect(axis.keepalive(1.5)).rejects.toThrow('Invalid keepalive days')
+    })
+
+    test('converts days into ledgers with the configured ledger close time', async () => {
+        const slower = setup({ledgerTime: 6})
+        expect(await slower.axis.keepalive(30)).toBe(1000 + 30 * 14_400)
+        expect(slower.signed[0].tx.operations[0].extendTo).toBe(30 * 14_400)
+        //an unreadable configuration falls back to 5-second ledgers
+        const fallback = setup({ledgerTime: new Error('HostError: Error(Storage, MissingValue)')})
+        expect(await fallback.axis.keepalive(30)).toBe(1000 + 30 * 17_280)
+    })
+
+    test('reports simulation errors, archived entries and failed transactions', async () => {
+        await expect(setup({simulation: {_parsed: true, error: 'extension too long', events: []}}).axis.keepalive())
+            .rejects.toThrow('extension too long')
+        const restore = {
+            _parsed: true,
+            latestLedger: 1000,
+            minResourceFee: '1',
+            transactionData: new SorobanDataBuilder(),
+            restorePreamble: {minResourceFee: '1', transactionData: new SorobanDataBuilder()},
+            events: []
+        }
+        await expect(setup({simulation: restore}).axis.keepalive()).rejects.toThrow('archived during the keepalive')
+        await expect(setup({executable: null}).axis.keepalive()).rejects.toThrow('instance not found')
+        await expect(setup({executable: {type: 'contractExecutableStellarAsset'}}).axis.keepalive()).rejects.toThrow('no Wasm code')
+        await expect(setup({resultStatus: 'FAILED'}).axis.keepalive()).rejects.toThrow('failed')
+        await expect(setup({sendStatus: 'ERROR'}).axis.keepalive()).rejects.toThrow('rejected')
+        await expect(setup({resultStatus: 'NOT_FOUND'}).axis.keepalive()).rejects.toThrow('not included in time')
+    })
+
+    /** Footprint operations signed in order, with the keys each one declares */
+    const operations = signed => signed.map(({tx}) => {
+        const {readOnly, readWrite} = tx.toEnvelope().value.tx.ext.value.resources.footprint
+        return {type: tx.operations[0].type, readOnly: base64(readOnly), readWrite: base64(readWrite)}
+    })
+
+    test('restores archived entries before extending them', async () => {
+        //an instance live until the latest ledger is archived for the next one
+        const {axis, signed, calls} = setup({instanceLiveUntil: 1000, codeLiveUntil: 800})
+        expect(await axis.keepalive()).toBe(1000 + 30 * 17_280)
+        expect(operations(signed)).toEqual([
+            {type: 'restoreFootprint', readOnly: [], readWrite: base64([instanceKey, codeKey])},
+            {type: 'extendFootprintTtl', readOnly: base64([instanceKey, codeKey]), readWrite: []}
+        ])
+        expect(calls.sent).toHaveLength(2)
+        //the restoration pays its own resource fee
+        expect(signed[0].tx.fee).toBe(String(100_000 + 62_000_000))
+    })
+
+    test('restores only the archived entry', async () => {
+        const code = setup({codeLiveUntil: 999})
+        await code.axis.keepalive()
+        expect(operations(code.signed).map(op => [op.type, op.readWrite])).toEqual([
+            ['restoreFootprint', base64([codeKey])],
+            ['extendFootprintTtl', []]
+        ])
+        const instance = setup({instanceLiveUntil: 10})
+        await instance.axis.keepalive()
+        expect(operations(instance.signed)[0].readWrite).toEqual(base64([instanceKey]))
+        //evicted code the RPC does not return is restored too
+        const evicted = setup({codeLiveUntil: null})
+        await evicted.axis.keepalive()
+        expect(operations(evicted.signed)[0]).toMatchObject({type: 'restoreFootprint', readWrite: base64([codeKey])})
+    })
+
+    test('does not extend when the restoration fails', async () => {
+        const {axis, signed, calls} = setup({instanceLiveUntil: 10, resultStatus: 'FAILED'})
+        await expect(axis.keepalive()).rejects.toThrow('failed')
+        expect(operations(signed).map(op => op.type)).toEqual(['restoreFootprint'])
+        expect(calls.sent).toHaveLength(1)
     })
 })

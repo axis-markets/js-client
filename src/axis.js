@@ -52,13 +52,13 @@ export class Axis extends Emitter {
     }
 
     /**
-     * Aggregator REST client
+     * AXIS REST API client
      * @type {AxisApiClient}
      * @readonly
      */
     api
     /**
-     * Aggregator WebSocket API client
+     * AXIS API WebSocket client
      * @type {AxisStreamClient}
      * @readonly
      */
@@ -190,7 +190,7 @@ export class Axis extends Emitter {
             return this.tokenBalances.getLatestLedger()
         if (this.ledger)
             return this.ledger
-        throw new Error('The current ledger is unknown: connect to the Aggregator or set the `rpcUrl` option')
+        throw new Error('The current ledger is unknown: connect to the AXIS API or set the `rpcUrl` option')
     }
 
     /**
@@ -260,12 +260,13 @@ export class Axis extends Emitter {
     }
 
     /**
-     * Extend the contract instance and code lifetime
-     * @param {Signer} [signer] - Transaction source, the default signer by default
-     * @return {Promise<void>}
+     * Extend the contract instance and code lifetime with an `ExtendFootprintTTL` operation, restoring them first if archived
+     * @param {{days?: number, signer?: Signer}} [params] - Lifetime in days (30 by default) and the transaction source
+     * (the default signer by default)
+     * @return {Promise<number>} - Ledger sequence both entries live until, at least
      */
-    async keepalive(signer) {
-        return this.contractClient(signer).keepalive()
+    async keepalive({days, signer} = {}) {
+        return this.contractClient(signer).keepalive(days)
     }
 
     /**
@@ -334,7 +335,7 @@ export class Axis extends Emitter {
             this.emit('config', data.config)
         }
         for (const record of data.markets || []) {
-            const key = pairKey(record.a, record.b)
+            const key = pairKey(record.base, record.quote)
             const market = this.markets.get(key)
             if (!market) {
                 const created = new AxisMarket(this, record)
@@ -396,9 +397,9 @@ export function toWsUrl(apiUrl) {
 
 /**
  * @typedef {{}} AxisOptions
- * @property {string} apiUrl - Aggregator REST API URL
+ * @property {string} apiUrl - AXIS REST API URL
  * @property {string} contractId - AXIS contract address
- * @property {string} [wsUrl] - Aggregator push API URL (`<apiUrl>/ws` with the `ws(s)` scheme by default)
+ * @property {string} [wsUrl] - AXIS API push channel URL (`<apiUrl>/ws` with the `ws(s)` scheme by default)
  * @property {string} [rpcUrl] - Stellar RPC URL
  * @property {string} [networkPassphrase] - Network passphrase (Pubnet by default)
  * @property {string} [fee] - Transaction fee

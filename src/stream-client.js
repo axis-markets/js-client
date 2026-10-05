@@ -1,13 +1,13 @@
 import {Emitter} from './emitter.js'
 
 /**
- * WebSocket client of the Aggregator push API
+ * WebSocket client of the AXIS API push channel
  *
  * Emits `open`, `close` and `error` (server errors not tied to a subscription).
  */
 export class AxisStreamClient extends Emitter {
     /**
-     * @param {string} url - WebSocket endpoint, e.g. `wss://api.axis.markets/ws`
+     * @param {string} url - WebSocket endpoint, e.g. `wss://demo-api.axis.markets/ws` (testnet)
      * @param {StreamClientOptions} [options]
      */
     constructor(url, {WebSocket: WebSocketImpl, pingInterval = 20_000, minReconnectDelay = 1_000, maxReconnectDelay = 30_000} = {}) {

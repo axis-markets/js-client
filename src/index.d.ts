@@ -22,7 +22,7 @@ export interface Order {
     amount: bigint;
     /** Buying token address */
     buying: string;
-    /** Expiration timestamp (0 = no expiration) */
+    /** Expiration UNIX timestamp in seconds (0 = no expiration) */
     expires: bigint;
     /** Unique order identifier, derived from the owner and the client nonce */
     id: bigint;
@@ -36,7 +36,7 @@ export interface Order {
 
 /** Token allowance granted to the contract as part of the call */
 export interface Approval {
-    /** Token the allowance is granted on: defaults to `selling` for `buy`, `sell` and `swap`, required in `update` approvals */
+    /** Token the allowance is granted on */
     asset?: string;
     /** Absolute allowance amount (0 revokes the approval) */
     amount: bigint;
@@ -58,21 +58,25 @@ export interface OrderUpdate {
 
 /** Contract configuration */
 export interface Config {
+    /** Address of the account allowed to freeze the contract and change the configuration */
+    safety_admin: string;
     /** Oracle contract address */
     oracle: string;
-    /** Amount of oracle tokens burned by the market creator to provision the oracle price feeds (always the oracle daily fee x 90) */
+    /** Days of price feeds a new market must buy (0 opens markets without a fee) */
+    listing_min_days: number;
+    /** Amount of oracle fee tokens paid by the market creator to provision the oracle price feeds (the oracle daily fee x `listing_min_days`) */
     market_listing_fee: bigint;
-    /** Address of the account allowed to freeze the contract, change the minimum trade size and replace the oracle */
-    safety_admin: string;
     /** Minimum trade value in USD, with 7 decimals precision (0 disables the limit) */
     min_trade_size: bigint;
+    /** Expected average ledger close time in seconds, used to convert entry lifetimes into ledgers */
+    ledger_time: number;
 }
 
 /** Market asset descriptor */
 export interface MarketSide {
     /** Token contract address */
     asset: string;
-    /** Whether the asset is quoted by the oracle */
+    /** Whether the asset is quoted by the oracle (with token decimals the valuation can handle) */
     listed: boolean;
     /** Token decimals (fetched only for listed assets) */
     decimals: number;
@@ -80,15 +84,15 @@ export interface MarketSide {
 
 /** Market record, stored on-chain */
 export interface Market {
-    /** First asset (canonical order) */
-    a: MarketSide;
-    /** Second asset (canonical order) */
-    b: MarketSide;
-    /** Creation timestamp */
+    /** Base asset, the first of the pair in canonical order */
+    base: MarketSide;
+    /** Quote asset, the second of the pair in canonical order */
+    quote: MarketSide;
+    /** Creation UNIX timestamp in seconds */
     created: bigint;
 }
 
-/** Orderbook `trade` event, one per fill (topics: `trade`, `selling`, `buying`) */
+/** Orderbook `trade` event, one per fill */
 export interface TradeContractEvent {
     /** Asset sold by the taker (topic) */
     selling: string;
@@ -108,7 +112,7 @@ export interface TradeContractEvent {
     left: bigint;
 }
 
-/** Orderbook `swap` event, one per call (topics: `swap`, `selling`, `buying`) */
+/** Orderbook `swap` event, one per call */
 export interface SwapContractEvent {
     /** Asset sold by the trader (topic) */
     selling: string;
@@ -122,7 +126,7 @@ export interface SwapContractEvent {
     bought: bigint;
 }
 
-/** Orderbook `new` event, an order created (topics: `new`, `selling`, `buying`) */
+/** Orderbook `new` event, an order created */
 export interface OrderCreatedContractEvent {
     /** Selling asset address (topic) */
     selling: string;
@@ -136,11 +140,11 @@ export interface OrderCreatedContractEvent {
     price: bigint;
     /** Current amount */
     amount: bigint;
-    /** Expiration timestamp (0 = no expiration) */
+    /** Expiration UNIX timestamp in seconds (0 = no expiration) */
     expires: bigint;
 }
 
-/** Orderbook `mod` event, an order changed outside a fill (topics: `mod`) */
+/** Orderbook `mod` event, an order changed outside a fill */
 export interface OrderUpdatedContractEvent {
     /** Unique order identifier */
     id: bigint;
@@ -148,40 +152,44 @@ export interface OrderUpdatedContractEvent {
     price: bigint;
     /** Current amount (0 = removed) */
     amount: bigint;
-    /** Expiration timestamp (0 = no expiration) */
+    /** Expiration UNIX timestamp in seconds (0 = no expiration) */
     expires: bigint;
 }
 
 /**
- * Orderbook `skip` event, a listed order its maker could not settle (backing short of the fill, cannot receive the
- * taker's asset, or the transfer failed); the order is left unchanged (topics: `skip`)
+ * Orderbook `skip` event, a listed order its maker could not settle: backing short of the fill, a missing or
+ * deauthorized trustline for the taker's asset, or the maker's asset could not be collected. The order is left
+ * unchanged. For `crossfill` it also flags a taker order its owner cannot back or be paid for
  */
 export interface OrderSkippedContractEvent {
     /** Order id */
     order: bigint;
 }
 
-/** Orderbook `refresh` event, a market checked against the oracle (topics: `refresh`, `a`, `b`; no data) */
+/** Orderbook `refresh` event, a market checked against the oracle (topics: `refresh`, `base`, `quote`, no data) */
 export interface MarketRefreshContractEvent {
-    /** First market asset (canonical order, topic) */
-    a: string;
-    /** Second market asset (canonical order, topic) */
-    b: string;
+    /** Base market asset (canonical order, topic) */
+    base: string;
+    /** Quote market asset (canonical order, topic) */
+    quote: string;
 }
 
-/** `freeze` event (topics: `freeze`) */
+/** `freeze` event */
 export interface FreezeContractEvent {
     /** Whether trading is blocked after the call */
     frozen: boolean;
 }
 
-/** `config` update notification event, emitted by the constructor, `delegate`, `set_oracle` or `set_floor` (topics: `config`) */
+/**
+ * `config` update notification event (constructor, `delegate`, `set_oracle`, `set_floor`, `set_listing_min_days`,
+ * `set_ledger_time`)
+ */
 export interface ConfigChangedContractEvent {
     /** Contract configuration after the call */
     config: Config;
 }
 
-/** A trade step in a multi-market swap path. */
+/** A trade step in a multi-market swap path */
 export interface TradeStep {
     /** Asset to buy at this step */
     asset: string;
@@ -202,6 +210,7 @@ export declare const ContractErrors: {
     709: {message: "NotFilled"};
     710: {message: "OrderNotFound"};
     711: {message: "OrderExists"};
+    712: {message: "IntermediaryCannotReceive"};
     720: {message: "OrderSizeTooSmall"};
     721: {message: "AssetsNotVerifiedByOracle"};
     722: {message: "AssetPriceOracleFetchFailed"};
@@ -210,11 +219,30 @@ export declare const ContractErrors: {
     740: {message: "Overflow"};
 }
 
+/** Errors of the Stellar Asset Contract, raised by the token transfers a trading call settles with */
+export declare const TokenErrors: {
+    1: {message: "InternalError"};
+    2: {message: "OperationNotSupportedError"};
+    3: {message: "AlreadyInitializedError"};
+    4: {message: "UnauthorizedError"};
+    5: {message: "AuthenticationError"};
+    6: {message: "AccountMissingError"};
+    7: {message: "AccountIsNotClassic"};
+    8: {message: "NegativeAmountError"};
+    9: {message: "AllowanceError"};
+    10: {message: "BalanceError"};
+    11: {message: "BalanceDeauthorizedError"};
+    12: {message: "OverflowError"};
+    13: {message: "TrustlineMissingError"};
+}
+
 /**
- * Compute the id of the order `owner` creates with `nonce`
- * (first 16 bytes of `sha256(xdr([owner, nonce]))` as a big-endian u128)
- * @param owner - Order owner address
- * @param nonce - u64 nonce the order was created with
+ * Compute the id of the order `owner` creates with `nonce`.
+ * Mirrors the contract: the first 16 bytes of `sha256(xdr(ScVec[owner: Address, nonce: u64]))`
+ * interpreted as a big-endian `u128` (the full 128 bits, no mask).
+ * @param owner - Order owner address (account or contract)
+ * @param nonce - Client-chosen u64 nonce
+ * @returns u128 order id
  */
 export declare function orderId(owner: string, nonce: bigint | number | string): bigint;
 
@@ -229,16 +257,22 @@ export interface ClientInitializationParams {
     contractId: string;
     /** Network passphrase (Pubnet passphrase by default) */
     networkPassphrase?: string;
-    /** Transaction fee (0.1 XLM by default) */
+    /** Inclusion fee bid in stroops (100,000 = 0.01 XLM by default), the simulated resource fee is added on top */
     fee?: string;
     /** Declare every supplied order id, and the balances and allowances of the makers behind them, in the read-write footprint of trading transactions (enabled by default) */
     autoFootprint?: boolean;
 }
 
+/**
+ * Callback for signing transactions generated by the client (`@stellar/stellar-sdk` 17 contract client shape)
+ * @param xdr - Transaction XDR to sign
+ * @param opts - Signing options passed by the SDK
+ * @returns Signed transaction response
+ */
 export type SignTransactionCallback = (
-    tx: string,
-    context: {network: string; networkPassphrase: string; accountToSign: string}
-) => Promise<{signedTxXdr: string; signerAddress?: string}>;
+    xdr: string,
+    opts?: {networkPassphrase?: string; address?: string; submit?: boolean; submitUrl?: string}
+) => Promise<{signedTxXdr: string; signerAddress?: string; error?: unknown}>;
 
 export interface TradeArguments {
     /** Trading order behavior */
@@ -275,6 +309,23 @@ export interface BuyTradeArguments extends TradeArguments {
     price: bigint;
 }
 
+/** Simulated trade, nothing signed or submitted */
+export interface TradeEstimate {
+    /** Maximum total network fee of the transaction, in stroops (inclusion fee bid plus resource fee) */
+    fee: bigint;
+    /** Inclusion fee bid, in stroops (the network charges the market rate up to it) */
+    inclusionFee: bigint;
+    /** Resource fee, in stroops, including the rent of an order created for the remainder */
+    resourceFee: bigint;
+    /** Expected amount of sold tokens */
+    sold: bigint;
+    /** Expected amount of bought tokens */
+    bought: bigint;
+    /** ID of the order the remainder would create */
+    orderId?: bigint;
+}
+
+/** Swap path and settings */
 export interface SwapArguments {
     /** Trade direction: `Sell` or `Buy` */
     direction: TradeDirection,
@@ -312,6 +363,7 @@ export interface SubsidizeArguments {
     amount: bigint;
 }
 
+/** Smart contract client for trading with AXIS DEX */
 export declare class AxisContractClient {
     constructor(params: ClientInitializationParams);
 
@@ -319,23 +371,23 @@ export declare class AxisContractClient {
     readonly publicKey: string;
 
     /**
-     * Fetch existing order
+     * Fetch existing order.
      * @param id - ID of the order to fetch
      * @returns Order fetched from the storage, undefined if not found or expired
      */
     order(id: bigint): Promise<Order | undefined>;
 
-    /** Fetch contract configuration */
+    /** Fetch contract configuration. */
     loadConfig(): Promise<Config>;
 
     /**
-     * Check whether the contract is frozen
+     * Check whether the contract is frozen.
      * @returns `true` if contract is frozen (trading and order management operations blocked)
      */
     isFrozen(): Promise<boolean>;
 
     /**
-     * Fetch market for the given asset pair
+     * Fetch market for the given asset pair.
      * @param selling - First market asset
      * @param buying - Second market asset
      * @returns Market record if the market exists
@@ -343,78 +395,90 @@ export declare class AxisContractClient {
     getMarket(selling: string, buying: string): Promise<Market | undefined>;
 
     /**
-     * Cancel existing orders, expired ones included: `update` with a zero amount per order (the contract has no
-     * `cancel`). A transaction can process up to 100 orders in one batch
+     * Cancel existing orders, expired ones included. A transaction can process up to 100 orders in one batch.
      * @param trader - Trader address
      * @param ids - IDs of the orders to cancel (non-existent orders are ignored)
-     * @throws If trader is not the owner of any existing order in `ids` or if the contract is frozen
+     * @throws If trader is not the owner of any existing order in `ids` (works while the contract is frozen)
      */
     cancel(trader: string, ids: Array<bigint>): Promise<void>;
 
     /**
      * Update the amount, price, or expiration of several orders in place, or remove them.
      * Orders that no longer exist are skipped; expired orders revived with the new expiration.
-     * A zero amount removes the order, expired ones included. An updated order's entry lifetime is extended to cover
-     * its expiration +1 day. Approvals and removals work in a frozen contract. A transaction can process up to 100
-     * orders in one batch
-     * @param params - Update parameters
+     * A zero amount removes the order, expired ones included. An updated order's entry lifetime is extended to cover its expiration +1 day.
+     * Approvals and removals work in a frozen contract and on a market without quoted assets.
+     * A transaction can process up to 100 orders in one batch.
      * @returns IDs of the orders to update
-     * @throws If the trader does not own an updated order, if order parameters are invalid, if an order is below the
-     * minimum value, if the new amounts are not backed by the trader's balance and allowance, if the contract is frozen
+     * @throws If the trader does not own an updated order, if order parameters are invalid, if an order is below the minimum value,
+     * if the new amounts are not backed by the trader's balance and allowance, an update changes an order on the frozen or not-quoted market
      */
     update(params: UpdateArguments): Promise<Array<bigint>>;
 
     /**
-     * Fill an existing order against matching orders from the orderbook. Profits from inefficiencies go to the trader
+     * Fill an existing order against matching orders from the orderbook. Profits from inefficiencies go to the trader.
      * @param trader - Trader address
      * @param takerOrderId - ID of the order that serves as a taker
      * @param orders - List of order IDs to match against
-     * @returns Amount the taker order sold, amount the taker received, surplus paid to the trader
-     * @throws If the taker order does not exist or has expired, if any of the orders provided do not match
-     * selling/buying asset, if the taker order's owner or the trader cannot receive the bought asset, if the contract is
-     * frozen
+     * @returns Amount the taker order sold, amount the makers delivered, surplus paid to the trader.
+     * @throws If the taker order does not exist or has expired, if the trader cannot receive the bought asset, if the
+     * contract cannot hold the bought asset, if the contract is frozen.
      */
     crossfill(trader: string, takerOrderId: bigint, orders: Array<bigint>): Promise<[bigint, bigint, bigint]>;
 
     /**
-     * Trade with DEX and create a buy limit order if the quote not executed in full
-     * @param params - Trade parameters
+     * Trade with DEX and create a buy limit order if the quote not executed in full.
      * @returns Amount of sold and bought tokens, ID of the newly created order if any
-     * @throws If the trader has insufficient balance or allowance, invalid `expires` field specified, a `Limit` trade
-     * targets a pair without a market, no reference price is available, any of the counter orders provided do not match
-     * selling/buying asset, or a live order with the same id exists
+     * @throws If the trader has insufficient balance or allowance, invalid `expires` field specified, a `Limit` trade targets a pair without a market,
+     * no reference price is available, a live order with the same id exists, the trader cannot receive `buying` (`CannotReceive`), or the contract
+     * cannot hold `buying` until its issuer authorizes it (`IntermediaryCannotReceive`).
      */
     buy(params: BuyTradeArguments): Promise<[bigint, bigint, bigint | undefined]>;
 
     /**
-     * Trade with DEX and create a sell limit order if the quote not executed in full
-     * @param params - Trade parameters
+     * Trade with DEX and create a sell limit order if the quote not executed in full.
      * @returns Amount of sold and bought tokens, ID of the newly created order if any
-     * @throws If the trader has insufficient balance or allowance, invalid `expires` field specified, a `Limit` trade
-     * targets a pair without a market, no reference price is available, any of the counter orders provided do not match
-     * selling/buying asset, or a live order with the same id exists
+     * @throws If the trader has insufficient balance or allowance, invalid `expires` field specified, a `Limit` trade targets a pair without a market,
+     * no reference price is available, a live order with the same id exists, the trader cannot receive `buying` (`CannotReceive`), or the contract
+     * cannot hold `buying` until its issuer authorizes it (`IntermediaryCannotReceive`).
      */
     sell(params: SellTradeArguments): Promise<[bigint, bigint, bigint | undefined]>;
 
     /**
-     * Swap tokens across several markets. The contract holds the intermediate hop proceeds only within the call
-     * @param params - Swap path and settings
+     * Simulate a buy trade without signing or submitting it, to show the network fee before the trade.
+     * @throws If the simulation fails, for the same reasons as `buy`
+     */
+    estimateBuy(params: BuyTradeArguments): Promise<TradeEstimate>;
+
+    /**
+     * Simulate a sell trade without signing or submitting it, to show the network fee before the trade.
+     * @throws If the simulation fails, for the same reasons as `sell`
+     */
+    estimateSell(params: SellTradeArguments): Promise<TradeEstimate>;
+
+    /**
+     * Swap tokens across several markets. The contract holds the intermediate hop proceeds only within the call.
      * @returns Amount of sold and bought tokens
-     * @throws If the route cannot satisfy the selling/buying amount, if `path` is empty or an amount is invalid, if any
-     * of the orders provided do not match trade step selling/buying asset, if the trader cannot pay for the fills or
-     * receive tokens, if the contract is frozen
+     * @throws If the route cannot satisfy the selling/buying amount, if `path` is empty or an amount is invalid,
+     * if the contract cannot hold an asset of the path, if the contract is frozen.
      */
     swap(params: SwapArguments): Promise<[bigint, bigint]>;
 
-    /** Extend the contract instance and code lifetime */
-    keepalive(): Promise<void>;
+    /**
+     * Extend the contract instance and code lifetime with an `ExtendFootprintTTL` operation, restoring the archived
+     * ones first with a `RestoreFootprint` transaction.
+     * @param days - Lifetime in days, 30 by default, at most the network maximum (180 days on mainnet)
+     * @returns Ledger sequence both entries live at least until
+     * @throws If `days` is invalid, if the instance is not found, if a simulation or a transaction fails
+     */
+    keepalive(days?: number): Promise<number>;
 
     /**
      * Re-check both market assets against the price oracle and cache oracle prices.
-     * A cached price is valid for up to 72 hours. A market without quoted assets stops accepting new limit orders; its
-     * outstanding orders stay cancellable and fillable. The record and the cached prices are rewritten only when they
-     * change. When the simulation writes nothing (the market and the cached prices are current, or the oracle has no
-     * newer price), the simulated result is returned and no transaction is submitted
+     * A cached price is valid for up to 72 hours. A market without quoted assets stops accepting
+     * new limit orders; its outstanding orders stay cancellable and fillable. The record and the
+     * cached prices are rewritten only when they change. When the simulation writes nothing (the market and the
+     * cached prices are current, or the oracle has no newer price), the simulated result is
+     * returned and no transaction is submitted.
      * @param selling - First market asset
      * @param buying - Second market asset
      * @returns Updated market record, undefined if the market does not exist
@@ -423,17 +487,20 @@ export declare class AxisContractClient {
     requote(selling: string, buying: string): Promise<Market | undefined>;
 
     /**
-     * Extend oracle price feeds access for a market, creating the market if it does not exist yet
-     * @param params - Subsidy parameters
+     * Extend oracle price feeds access for a market, creating the market if it does not exist yet.
      * @returns New access expiration UNIX timestamps (in seconds) per oracle-listed asset
-     * @throws If `amount` is invalid, if the market does not exist and the amount is below the market listing fee, if
-     * neither market asset is quoted by the oracle, if the contract is frozen
+     * @throws If `amount` is invalid, if `selling` equals `buying`, if the market does not exist and the amount is below
+     * the market listing fee, if neither market asset is quoted by the oracle, if the contract is frozen
      */
     subsidize(params: SubsidizeArguments): Promise<Array<bigint>>;
 }
 
-/** Error thrown when the Aggregator API responds with a non-success HTTP status */
+/** Error thrown when the AXIS API responds with a non-success HTTP status */
 export declare class AxisApiError extends Error {
+    /**
+     * @param message - Error message returned by the API
+     * @param status - HTTP status code
+     */
     constructor(message: string, status: number);
 
     /** HTTP status code associated with the error */
@@ -449,6 +516,12 @@ export interface QuoteParams {
     amount: string | number;
     /** Restrict to the direct market only (no intermediate-asset routes) */
     direct?: boolean;
+    /**
+     * Highest maker price to cross (requires `direct`), in the units of a hop `worstPrice`: `sellingAsset` per unit of
+     * `buyingAsset`, scaled by 10^18. Quotes the crossing of a limit order: orders priced above it are left out and the
+     * route may trade less than `amount`
+     */
+    maxPrice?: bigint | string;
 }
 
 export interface QuotePathStep {
@@ -584,24 +657,26 @@ export interface MarketInfo {
     orderTypes: string[];
 }
 
-/** Contract configuration tracked by the indexer */
 export interface ContractInfoConfig {
     /** Safety admin address */
     safetyAdmin: string;
     /** Price oracle contract address */
     oracle: string;
-    /** Fee token amount burned to open a market */
+    /** Days of price feeds a new market must buy (0 opens markets without a fee) */
+    listingMinDays?: number;
+    /** Oracle fee tokens a market creator pays to provision the price feeds */
     marketListingFee: string;
     /** Minimum trade value in USD with 7 decimals (0 = disabled) */
     minTradeSize: string;
+    /** Expected ledger close time in seconds */
+    ledgerTime?: number;
 }
 
-/** Market tracked by the indexer */
 export interface ContractInfoMarket {
-    /** First market asset */
-    a: string;
-    /** Second market asset */
-    b: string;
+    /** Base market asset, the first of the pair in canonical order */
+    base: string;
+    /** Quote market asset, the second of the pair in canonical order */
+    quote: string;
     /** Creation timestamp (UTC) */
     created: string;
     /** Last oracle check timestamp (UTC) */
@@ -623,7 +698,7 @@ export interface OrdersParams {
     owner?: string;
     /** Filter by asset(s) - every listed asset must be one of the order assets (two assets select a pair) */
     asset?: string | string[];
-    /** Pagination cursor (order id) */
+    /** `cursor` of the last order received (its creation position, not the order id) */
     cursor?: string | bigint;
     /** Max orders to return */
     limit?: number | string;
@@ -634,7 +709,7 @@ export interface OrderHistoryParams {
     owner?: string;
     /** Asset pair `[base, quote]` (contract ids) */
     pair?: string[];
-    /** Pagination cursor (order id) */
+    /** `cursor` of the last order received (its creation position, not the order id) */
     cursor?: string | bigint;
     /** Max orders to return */
     limit?: number | string;
@@ -645,7 +720,7 @@ export interface TradesParams {
     trader?: string;
     /** Asset pair `[base, quote]` (contract ids) */
     pair?: string[];
-    /** Pagination cursor (trade id) */
+    /** `cursor` of the last record received (the trade or swap id) */
     cursor?: string | bigint;
     /** Max trades to return */
     limit?: number | string;
@@ -683,6 +758,11 @@ export interface ApiBacking {
     authorized: boolean;
     /** Effective budget, min(balance, allowance), 0 when unauthorized or expired */
     budget: string;
+    /**
+     * Amount the account can still receive (trustline limit minus balance and buying
+     * liabilities), omitted when unlimited or unknown
+     */
+    headroom?: string;
     /** Last load timestamp (UTC) */
     updated?: string;
     /** Last `skip` event of an order selling the token (UTC) */
@@ -737,6 +817,30 @@ export interface ApiOrder {
     cursor?: string;
 }
 
+/** Serialized swap returned by the API, one per `swap` call */
+export interface ApiSwap {
+    /** Record type */
+    type: 'swap';
+    /** Swap ID */
+    id: string;
+    /** Trader address */
+    trader: string;
+    /** Sold asset contract id */
+    soldAsset: string;
+    /** Bought asset contract id */
+    boughtAsset: string;
+    /** Sold tokens amount */
+    sold: string;
+    /** Bought tokens amount */
+    bought: string;
+    /** Approximate swap price */
+    price: string;
+    /** Pagination cursor */
+    cursor: string;
+    /** Swap timestamp (UTC) */
+    timestamp: string;
+}
+
 /** Serialized trade returned by the API */
 export interface ApiTrade {
     /** Record type */
@@ -759,6 +863,11 @@ export interface ApiTrade {
     bought: string;
     /** Order amount left after the fill */
     left?: string;
+    /**
+     * The fill of a `crossfill` taker order: `taker` is the caller, paid the surplus, and the amounts mirror the makers'
+     * fills of the same call (left out of candles and volume)
+     */
+    crossfill?: boolean;
     /** Approximate trade price */
     price: string;
     /** Pagination cursor */
@@ -767,19 +876,74 @@ export interface ApiTrade {
     timestamp: string;
 }
 
-/** HTTP client for the AXIS Aggregator REST API */
+export interface FailuresParams {
+    /** Caller of the failed transaction, or a party of the failed transfer */
+    account?: string;
+    /** Contract function (`trade`, `swap`, `crossfill`, `update`, ...) */
+    fn?: string;
+    /** `cursor` of the last record received */
+    cursor?: string | bigint;
+    /** Max records to return (20 by default, at most 500) */
+    limit?: number | string;
+}
+
+/**
+ * Failed AXIS call (made by the transaction or through another contract, the transaction failed
+ * or a calling contract caught the failure). It changes no state and blames no party:
+ * a token error on a settlement transfer does not tell the payer who could not pay from the recipient who could not be
+ * credited (e.g. a full trustline), and in a `crossfill` the makers are paid by the taker order owner, not the caller
+ */
+export interface ApiFailure {
+    /** Record type */
+    type: 'failure';
+    /** Record id (position of the transaction plus the index of the failed call) */
+    id: string;
+    /** Transaction hash */
+    txHash: string;
+    /** Ledger sequence */
+    ledger: number;
+    /** Ledger close time (UTC) */
+    timestamp: string;
+    /** Contract function called */
+    fn: string;
+    /** The `trader` or `sponsor` argument, the transaction source for other functions */
+    caller: string;
+    /** Maker order ids listed by the call */
+    orders: string[];
+    /** Taker order id of a `crossfill` */
+    takerOrder?: string;
+    /** Operation result code */
+    result: string;
+    /** The transaction succeeded: a calling contract caught the failed AXIS call */
+    caught?: boolean;
+    /**
+     * `contract`: a contract error (`error`), `transfer`: a token transfer failed (`transfer`, either side may be at
+     * fault), `resources`: a resource limit, the refundable fee or an archived entry, `auth`: an authorization failure,
+     * `unknown`: no diagnostic events
+     */
+    reason: 'contract' | 'transfer' | 'resources' | 'auth' | 'unknown';
+    /** Contract error that failed the call */
+    error?: {contract: string | null, code: number, name?: string};
+    /** Token transfer that failed */
+    transfer?: {token: string, fn: string, from: string, to: string, amount: string};
+    /** Pagination cursor */
+    cursor: string;
+}
+
+/** HTTP client for the AXIS REST API */
 export declare class AxisApiClient {
-    /** @param serverUrl - Base URL of the Aggregator server */
+    /** @param serverUrl - Base URL of the AXIS API server */
     constructor(serverUrl: string);
 
-    /** Base URL of the Aggregator server */
+    /** Base URL of the AXIS API server */
     readonly serverUrl: string;
 
     /**
      * Price quote and candidate trade routes for selling a fixed amount of the source asset
      * @param params - Quote request parameters
      * @returns Best routes ranked by profitability
-     * @throws {AxisApiError} If the server is not ready or there is not enough liquidity
+     * @throws {AxisApiError} 409 if the server is not ready or routing fails, 400 on invalid parameters. Not enough
+     * liquidity resolves with `status: 'unfeasible'`, a frozen contract with `status: 'rejected'`
      */
     quoteSell(params: QuoteParams): Promise<QuoteResult>;
 
@@ -787,7 +951,8 @@ export declare class AxisApiClient {
      * Price quote and candidate trade routes for buying a fixed amount of the destination asset
      * @param params - Quote request parameters
      * @returns Best routes ranked by profitability
-     * @throws {AxisApiError} If the server is not ready or there is not enough liquidity
+     * @throws {AxisApiError} 409 if the server is not ready or routing fails, 400 on invalid parameters. Not enough
+     * liquidity resolves with `status: 'unfeasible'`, a frozen contract with `status: 'rejected'`
      */
     quoteBuy(params: QuoteParams): Promise<QuoteResult>;
 
@@ -842,7 +1007,7 @@ export declare class AxisApiClient {
     /**
      * Retrieve a single order by ID
      * @param id - Order ID
-     * @returns Order (throws `AxisApiError` with status 404 if not found)
+     * @returns Order (throws AxisApiError with status 404 if not found)
      */
     getOrder(id: bigint | string | number): Promise<ApiOrder>;
 
@@ -854,11 +1019,18 @@ export declare class AxisApiClient {
     getOrderHistory(params?: OrderHistoryParams): Promise<ApiOrder[]>;
 
     /**
-     * Retrieve recent trades
+     * Retrieve recent trades and swaps, newest first
      * @param params - Filter parameters
-     * @returns Recent trades matching the filter
+     * @returns Recent trades and swaps matching the filter (told apart by `type`)
      */
-    getTrades(params?: TradesParams): Promise<ApiTrade[]>;
+    getTrades(params?: TradesParams): Promise<Array<ApiTrade | ApiSwap>>;
+
+    /**
+     * Failed AXIS calls, newest first (diagnostics: a failure changes no state, and a record never blames a party, see
+     * {@link ApiFailure})
+     * @param params - Filter parameters
+     */
+    getFailures(params?: FailuresParams): Promise<ApiFailure[]>;
 }
 
 /** Price scale of the contract (18 decimals) */
@@ -900,7 +1072,7 @@ export declare function invertPrice(price: bigint): bigint;
 export declare function invertTicker(entry: TickerEntry): TickerEntry;
 
 /**
- * Parse an Aggregator API timestamp (`YYYY-MM-DD HH:mm:ss` UTC)
+ * Parse an AXIS API timestamp (`YYYY-MM-DD HH:mm:ss` UTC)
  * @returns UNIX milliseconds, 0 when missing or invalid
  */
 export declare function parseApiDate(value: string | number | undefined): number;
@@ -958,7 +1130,6 @@ export declare class Emitter {
 export interface StreamMessage {
     type: string;
     topic?: string;
-    /** Echoed request id (snapshots and errors) */
     id?: number;
     [key: string]: any;
 }
@@ -975,11 +1146,12 @@ export interface StreamClientOptions {
 }
 
 /**
- * WebSocket client of the Aggregator push API.
+ * WebSocket client of the AXIS API push channel
+ *
  * Emits `open`, `close` and `error` (server errors not tied to a subscription).
  */
 export declare class AxisStreamClient extends Emitter {
-    /** @param url - WebSocket endpoint, e.g. `wss://api.axis.markets/ws` */
+    /** @param url - WebSocket endpoint, e.g. `wss://demo-api.axis.markets/ws` (testnet) */
     constructor(url: string, options?: StreamClientOptions);
 
     /** WebSocket endpoint */
@@ -989,10 +1161,10 @@ export declare class AxisStreamClient extends Emitter {
 
     /**
      * Subscribe to a channel; connects on the first subscription
-     * @param channel - Channel name
-     * @param params - Channel parameters
-     * @param handler - Receives the snapshot (again after every reconnect), the changes, and `{type: 'error'}` if the
-     * server rejects the subscription
+     * @param params -
+     *   Channel parameters
+     * @param handler - Receives the snapshot (again after every reconnect), the
+     *   changes, and `{type: 'error'}` if the server rejects the subscription
      * @returns Unsubscribe function
      */
     subscribe(channel: 'contract' | 'ticker' | 'account' | 'trades' | 'depth' | 'candles', params: {address?: string, market?: string, depth?: number, step?: string, resolution?: number | string, limit?: number}, handler: (message: StreamMessage) => void): () => void;
@@ -1032,32 +1204,33 @@ export interface Signer {
 }
 
 export interface AxisOptions {
-    /** Aggregator REST API URL */
+    /** AXIS REST API URL */
     apiUrl: string;
     /** AXIS contract address */
     contractId: string;
-    /** Aggregator push API URL (`<apiUrl>/ws` with the `ws(s)` scheme by default) */
+    /** AXIS API push channel URL (`<apiUrl>/ws` with the `ws(s)` scheme by default) */
     wsUrl?: string;
-    /** Stellar RPC URL, required to trade; also reads allowances and the ledger when the push API does not provide them */
+    /** Stellar RPC URL */
     rpcUrl?: string;
     /** Network passphrase (Pubnet by default) */
     networkPassphrase?: string;
     /** Transaction fee */
     fee?: string;
-    /** Default signer settings for contract operations (`keepalive`, `requote`, `subsidize`) */
+    /** Default signer settings for contract operations */
     signer?: Signer;
-    /** REST polling period while the push connection is down, in milliseconds (15 s by default) */
+    /** REST polling period while the push connection is down, in milliseconds */
     fallbackPollInterval?: number;
-    /** WebSocket implementation (the global one by default) */
+    /** WebSocket implementation */
     WebSocket?: typeof WebSocket;
 }
 
 /**
- * High-level AXIS DEX state.
+ * High-level AXIS DEX state
+ *
  * Emits:
  * - `change` - anything in the contract state changed
  * - `frozen` `boolean` - the frozen state toggled
- * - `config` {@link ContractInfoConfig} - contract configuration changed
+ * - `config` {ContractInfoConfig} - contract configuration changed
  * - `market` `{market: AxisMarket, created: boolean}` - a market was opened or updated
  * - `connection` `boolean` - WebSocket push connection opened or dropped
  * - `ledger` `number` - new ledger processed by the indexer
@@ -1065,41 +1238,42 @@ export interface AxisOptions {
 export declare class Axis extends Emitter {
     constructor(options: AxisOptions);
 
-    /** Aggregator REST client */
+    /** AXIS REST API client */
     readonly api: AxisApiClient;
-    /** Aggregator WebSocket API client */
+    /** AXIS API WebSocket client */
     readonly stream: AxisStreamClient;
-    /** Token balance wrappers; undefined without `rpcUrl` */
+    /** Token balance wrappers */
     readonly tokenBalances: TokenBalance | undefined;
     /** Contract address of the native XLM token */
     readonly nativeAsset: string;
-    /** Last known ledger (0 until pushed) */
+    /** Last known ledger */
     readonly ledger: number;
-    /** When `ledger` was last updated, UNIX milliseconds */
+    /** Last updated UNIX milliseconds */
     readonly ledgerTime: number;
     /** Whether trading is suspended */
     readonly frozen: boolean;
-    /** Contract configuration, undefined until loaded */
+    /** Contract configuration */
     readonly config: ContractInfoConfig | undefined;
-    /** Available AXIS markets, by the canonical key `a/b` */
+    /** Available AXIS markets */
     readonly markets: Map<string, AxisMarket>;
-    /** 24h ticker entries by the canonical key, filled while `subscribeTicker` runs */
+    /** 24h ticker entries */
     readonly tickers: Map<string, TickerEntry>;
     /** Whether the contract state loaded */
     readonly loaded: boolean;
 
     /** Load the contract state and track its changes */
     connect(): Promise<Axis>;
-    /** Current ledger sequence: the pushed one while connected and fresh, otherwise read over RPC */
+    /** Current ledger sequence */
     getLedger(): Promise<number>;
     /**
-     * Get market of the asset pair, in either order
+     * Get market of the asset pair
      * @param asset1 - Token contract address
      * @param asset2 - Token contract address
      */
     getMarket(asset1: string, asset2: string): AxisMarket | undefined;
     /**
-     * Get live order by id, from a tracked account or the Aggregator
+     * Get live order by id
+     * @param id - Order id
      * @returns Undefined if not found (filled, removed, expired)
      */
     getOrder(id: bigint | string): Promise<AccountOrder | undefined>;
@@ -1110,16 +1284,17 @@ export declare class Axis extends Emitter {
      */
     account(address: string, options?: {signTransaction?: SignTransactionCallback}): AxisAccount;
     /**
-     * Stream the 24h ticker of every market (canonical orientation).
+     * Stream the 24h ticker of every market
      * Sends a full snapshot, then updates caused by trades
      * @returns Unsubscribe function
      */
     subscribeTicker(callback?: (ticker: Ticker24hResult) => void): () => void;
     /**
-     * Extend the contract instance and code lifetime
-     * @param signer - Transaction source, the default signer by default
+     * Extend the contract instance and code lifetime with an `ExtendFootprintTTL` operation, restoring them first if archived
+     * @param params - Lifetime in days (30 by default) and the transaction source (the default signer by default)
+     * @returns Ledger sequence both entries live until, at least
      */
-    keepalive(signer?: Signer): Promise<void>;
+    keepalive(params?: {days?: number; signer?: Signer}): Promise<number>;
     /** Stop following the contract state and tracked accounts */
     close(): void;
 }
@@ -1127,23 +1302,19 @@ export declare class Axis extends Emitter {
 /** Derive the push API endpoint from the REST API URL */
 export declare function toWsUrl(apiUrl: string): string;
 
-/** DEX Market; assets in the contract canonical order */
+/** DEX Market */
 export declare class AxisMarket {
-    /** Base asset */
-    readonly a: string;
-    /** Quote asset */
-    readonly b: string;
-    /** Canonical market key `a/b` */
-    readonly key: string;
-    /** Base asset (`a`) */
+    /** Base asset, the first of the pair in the contract canonical order */
     readonly base: string;
-    /** Quote asset (`b`) */
+    /** Quote asset, the second of the pair in the contract canonical order */
     readonly quote: string;
+    /** Canonical market key `base/quote` */
+    readonly key: string;
     /** Creation timestamp (first oracle check) (UNIX milliseconds) */
     readonly created: number;
     /** Last oracle check (UNIX milliseconds) */
     readonly refreshed: number;
-    /** Last 24h ticker entry of the market, available while {@link Axis.subscribeTicker} runs */
+    /** Last 24h ticker entry of the market, available while {@link Axis#subscribeTicker} runs */
     readonly ticker: TickerEntry | undefined;
 
     /** Check whether the asset is one of the market assets */
@@ -1151,7 +1322,6 @@ export declare class AxisMarket {
     /**
      * The other market asset
      * @param asset - One of the market assets
-     * @throws If the asset does not belong to the market
      */
     counter(asset: string): string;
     /**
@@ -1167,28 +1337,27 @@ export declare class AxisMarket {
     subsidize(params: {amount: bigint, sponsor?: string, signer?: Signer}): Promise<bigint[]>;
     /**
      * Orderbook depth data with given precision
-     * @param params - `base` is the base asset (`a` by default), `step` the price step (automatic by default)
+     * @param params - `base` is the base asset, `step` the price step (automatic by default)
      */
     getDepth(params?: {base?: string, depth?: number, step?: string, limit?: number}): Promise<OrderbookDepth>;
     /**
-     * Stream the orderbook depth.
+     * Stream the orderbook depth
      * Returns a snapshot, then updates on book changes
      * @returns Unsubscribe function
      */
     subscribeDepth(params: {base?: string, depth?: number, step?: string, limit?: number}, callback: (depth: OrderbookDepth) => void): () => void;
     /**
-     * Stream the market trades.
+     * Stream the market trades
      * Returns a snapshot, then updates on trades
      * @param callback - Trades and whether they are the snapshot
      * @returns Unsubscribe function
      */
     subscribeTrades(callback: (trades: ApiTrade[], snapshot: boolean) => void): () => void;
     /**
-     * Stream the market candles.
+     * Stream the market candles
      * Returns a snapshot, then updates on trades
-     * @param params - `base` is the base asset of the view, `resolution` in seconds or an alias (`5m`, `1h`, …), `limit`
-     * the candles in the snapshot (200 by default, at most 200)
-     * @param callback - Candles and whether they are the snapshot
+     * @param params - `base` is the base asset of the view, `resolution` in seconds or an alias (`5m`, `1h`, …), `limit` the candles in the snapshot (200 by default, at most 200)
+     * @param callback - Candles
      * @returns Unsubscribe function
      */
     subscribeCandles(params: {base?: string, resolution: number | string, limit?: number}, callback: (candles: Candle[], snapshot: boolean) => void): () => void;
@@ -1204,7 +1373,7 @@ export interface AccountOrder {
     selling: string;
     /** Bought token */
     buying: string;
-    /** Market key (canonical `a/b`) */
+    /** Market key */
     market: string;
     /** Current status */
     status: 'ACTIVE' | 'FILLED' | 'CANCELED' | 'EXPIRED';
@@ -1222,7 +1391,7 @@ export interface AccountOrder {
     updated: number;
     /** Paging cursor (undefined for unconfirmed local orders) */
     cursor?: bigint;
-    /** Share of the account budget in `selling` that backs the order; null when unknown */
+    /** Share of the account budget in `selling` that backs the order */
     backed: bigint | null;
     /** `backed / amount` (0..1), null when unknown */
     backedPct: number | null;
@@ -1296,13 +1465,13 @@ export interface AccountTradeParams {
     amount: bigint | string;
     /** Limit price, contract scale; omitted for a market order */
     price?: bigint | string;
-    /** `Limit` by default, `Fill` for a market order */
+    /** {@link OrderKind}: `Limit` by default, `Fill` for a market order */
     kind?: OrderKind;
     /** Expiration UNIX timestamp (seconds) of the resting remainder */
     expires?: number;
     /** Counter orders to cross, looked up automatically when omitted */
     orders?: Array<bigint | string>;
-    /** Explicit approval (`null` for none), planned automatically when omitted */
+    /** Explicit approval (`null` for none) */
     approve?: Approval | null;
 }
 
@@ -1326,18 +1495,19 @@ export interface AccountSwapParams {
     buying: string;
     /** `selling` amount of a sell, `buying` amount of a buy (raw units) */
     amount: bigint | string;
-    /** `Sell` by default */
+    /** {@link TradeDirection}, `Sell` by default */
     direction?: TradeDirection;
     /** Price tolerance as a fraction (0.005 = 0.5%), 0 by default */
     slippage?: number;
 }
 
 /** Market filter: a market key `x/y`, an {@link AxisMarket} or a pair of assets, in any order */
-export type AccountMarketFilter = string | {a: string, b: string} | string[];
+export type AccountMarketFilter = string | {base: string, quote: string} | string[];
 
 /**
  * Trader wrapper that tracks every open order of an account across all markets and the account backing.
- * Create it with {@link Axis.account}.
+ * Create it with {@link import('./axis.js').Axis#account}.
+ *
  * Emits:
  * - `ready` - the account state was loaded
  * - `new` {@link AccountOrder} - an order was created (confirmed by the indexer)
@@ -1351,8 +1521,8 @@ export type AccountMarketFilter = string | {a: string, b: string} | string[];
  * - `order` `{action, order, fill?}` - any order change
  * - `backing` `{asset, backing}` - the balance, allowance or the backing split of the orders selling a token changed
  * - `approve` `{asset, amount, liveUntil}` - a trading call is about to grant an allowance
- * - `trade` {@link ApiTrade} - the account performed a trade
- * - `swap` - the account performed a swap
+ * - `trade` {ApiTrade} - the account performed a trade
+ * - `swap` {ApiSwap} - the account performed a swap
  * - `change` - the open orders or the backing changed
  * - `error` `Error` - the push API rejected the account subscription
  */
@@ -1369,9 +1539,9 @@ export declare class AxisAccount extends Emitter {
     readonly ready: Promise<void>;
     /** Whether the account state has been loaded */
     readonly loaded: boolean;
-    /** Spendable balances in every tracked token by token contract id */
+    /** Get spendable balances in every tracked token by token contract id */
     readonly balances: Map<string, bigint>;
-    /** Whether the account exists on the ledger; undefined until its XLM backing is known */
+    /** Whether the account exists on the ledger */
     readonly funded: boolean | undefined;
 
     /**
@@ -1381,8 +1551,8 @@ export declare class AxisAccount extends Emitter {
      */
     getBalance(asset: string): bigint | undefined;
     /**
-     * Retrieve open orders, newest first, including unconfirmed ones created by this client
-     * @param filter - `market` is an {@link AxisMarket}, a market key or a pair of assets in any order
+     * Retrieve open orders, newest first
+     * @param filter - `market` is an {AxisMarket} or a pair of assets in any order
      */
     getOrders(filter?: {market?: AccountMarketFilter, selling?: string, buying?: string}): AccountOrder[];
     /** Get open order by id */
@@ -1399,25 +1569,36 @@ export declare class AxisAccount extends Emitter {
      */
     getAllowance(asset: string): AccountAllowance;
     /**
-     * Sell tokens creating a limit remainder order if not executed in full (market order without `price`)
+     * Sell tokens creating a limit remainder order if not executed in full
      * @param params - `amount` of `selling` to sell; `price` is the minimum `buying` per 1 `selling`
      */
     sell(params: AccountTradeParams): Promise<AccountTradeResult>;
     /**
-     * Buy tokens creating a limit remainder order if not executed in full (market order without `price`)
+     * Buy tokens creating a limit remainder order if not executed in full
      * @param params - `amount` of `buying` to acquire; `price` is the maximum `selling` per 1 `buying`
      */
     buy(params: AccountTradeParams): Promise<AccountTradeResult>;
     /**
-     * Change the amount, price or expiration of open orders (omitted fields keep their current values); the allowance
-     * is raised as needed
+     * Simulate a sell with the same crossing and approval as `sell`, without signing or submitting it
+     * @param params - Same as `sell`
+     * @returns Network fee and expected result
+     */
+    estimateSell(params: AccountTradeParams): Promise<TradeEstimate>;
+    /**
+     * Simulate a buy with the same crossing and approval as `buy`, without signing or submitting it
+     * @param params - Same as `buy`
+     * @returns Network fee and expected result
+     */
+    estimateBuy(params: AccountTradeParams): Promise<TradeEstimate>;
+    /**
+     * Change the amount, price or expiration of open orders (omitted fields keep their current values)
      * @returns Updated order ids
      */
     update(updates: Array<{id: bigint | string, amount?: bigint, price?: bigint, expires?: number}>): Promise<bigint[]>;
     /** Cancel open orders */
     cancel(ids: Array<bigint | string>): Promise<void>;
     /**
-     * Cancel all open orders, optionally of one market
+     * Cancel all open orders
      * @returns Canceled order ids
      */
     cancelAll(filter?: {market?: AccountMarketFilter}): Promise<string[]>;
@@ -1427,13 +1608,12 @@ export declare class AxisAccount extends Emitter {
      * @param orders - Counter orders, looked up automatically when omitted
      */
     crossfill(takerOrderId: bigint | string, orders?: Array<bigint | string>): Promise<{sold: bigint, bought: bigint, surplus: bigint}>;
-    /** Swap across one or several markets along the best route found by the Aggregator */
+    /** Swap across one or several markets along the best route found by the AXIS API */
     swap(params: AccountSwapParams): Promise<{sold: bigint, bought: bigint, approve?: Approval}>;
     /**
      * Compute approval for a call
      * @param asset - Token contract id
      * @param required - Max amount the call may spend
-     * @returns Undefined when the current allowance covers the call
      */
     planApproval(asset: string, required: bigint): Promise<{amount: bigint, liveUntil: number} | undefined>;
     /** Reload current account state from the REST API */

@@ -47,6 +47,20 @@ export const MAKER_INSTRUCTIONS = 3_000_000
 export const MAKER_RESOURCE_FEE = 20_000n
 
 /**
+ * CPU instructions added when the settlement entries of the call were declared: the transfer forwarding what the makers
+ * delivered from the DEX contract to the receiver, and the receive checks before it.
+ * @type {number}
+ */
+export const FORWARD_INSTRUCTIONS = 2_000_000
+
+/**
+ * Resource fee (stroops) added when the settlement entries of the call were declared (instructions ~5k, the forwarding
+ * `transfer` event ~2k, rounded up).
+ * @type {bigint}
+ */
+export const FORWARD_RESOURCE_FEE = 10_000n
+
+/**
  * Ledger entry types read from disk when a transaction is applied: every declared one counts towards the disk read
  * bytes, whether the execution touches it or not.
  * @type {Set<string>}
@@ -207,32 +221,54 @@ export function ensureOrdersFootprint(tx, contractId, orderIds) {
 /**
  * Complete the footprint of a simulated trading transaction, so it still applies when the book moves between simulation
  * and execution (an order repriced back into range, a maker's backing restored, an earlier order shrunk). Every listed
- * order entry is declared read-write, and so is every entry the settlement may write for the order's maker: the balance
- * of the asset the maker sells, the allowance on it granted to the DEX contract, and the balance of the asset the maker
- * receives. Makers of tokens that are not Stellar Asset Contracts keep what the simulation recorded (their storage layout
- * is unknown). Entries are added in list order, orders first, while the footprint limits allow.
+ * order entry is declared read-write, then the entries the settlement writes for the call itself: the DEX contract's own
+ * balance of every asset passing through it (makers deliver to the contract, which forwards to the receiver) and the
+ * receiver's balance of the bought asset. Then, for every order's maker, the balance of the asset the maker sells, the
+ * allowance on it granted to the DEX contract, and the balance of the asset the maker receives. Tokens that are not
+ * Stellar Asset Contracts keep what the simulation recorded (their storage layout is unknown). Entries are added in that
+ * order while the footprint limits allow.
  * @param {contract.AssembledTransaction} tx - Simulated transaction
  * @param {string} contractId - DEX contract address
  * @param {Array<bigint|number|string>} orderIds - Order ids passed to the contract call
  * @param {FootprintOptions} options
- * @return {Promise<{orders: number, makerEntries: number}>} - Number of order and maker entries added to the read-write footprint
+ * @return {Promise<{orders: number, settlementEntries: number, makerEntries: number}>} - Number of order, settlement and
+ * maker entries added to the read-write footprint
  */
-export async function completeFootprint(tx, contractId, orderIds, {server, tokens = [], assetCache = new Map()}) {
+export async function completeFootprint(tx, contractId, orderIds, {server, tokens = [], assetCache = new Map(), passThrough = [], receiver, bought, takerOrder}) {
     if (!isPatchable(tx) || !orderIds?.length)
-        return {orders: 0, makerEntries: 0}
-    const orderKeys = collectOrderIds(orderIds).map(id => orderLedgerKey(contractId, id))
+        return {orders: 0, settlementEntries: 0, makerEntries: 0}
+    const ids = collectOrderIds(orderIds)
+    const orderKeys = ids.map(id => orderLedgerKey(contractId, id))
     //one request for the orders and the known tokens, another one only for tokens first seen in the orders
-    const knownTokens = unresolved(tokens, assetCache)
+    const knownTokens = unresolved([...tokens, ...passThrough, ...(bought ? [bought] : [])], assetCache)
     const entries = await loadEntries(server, [...orderKeys, ...knownTokens.map(instanceLedgerKey)])
     cacheAssets(entries, knownTokens, assetCache)
-    const orders = orderKeys
-        .map(key => entries.get(key.toXDR('base64')))
-        .filter(Boolean)
-        .map(entry => decodeStoredOrder(entry.contractData.val))
+    const orders = []
+    for (let i = 0; i < ids.length; i++) {
+        const entry = entries.get(orderKeys[i].toXDR('base64'))
+        if (entry) {
+            orders.push({id: ids[i], ...decodeStoredOrder(entry.contractData.val)})
+        }
+    }
+    //a crossfill buys what the taker order buys: it passes through the contract, which pays the owner and the receiver
+    const passing = [...passThrough]
+    if (takerOrder !== undefined && takerOrder !== null) {
+        const taker = orders.find(order => order.id === BigInt(takerOrder))
+        if (taker) {
+            passing.push(taker.buying)
+            bought ??= taker.buying
+        }
+    }
     const newTokens = unresolved(orders.flatMap(({selling, buying}) => [selling, buying]), assetCache)
     if (newTokens.length) {
         cacheAssets(await loadEntries(server, newTokens.map(instanceLedgerKey)), newTokens, assetCache)
     }
+    //entries the settlement of the call writes whichever makers fill
+    const settlementKeys = [
+        ...[...new Set(passing)].map(token => balanceLedgerKey(contractId, token, assetCache.get(token) ?? null)),
+        receiver && bought ? balanceLedgerKey(receiver, bought, assetCache.get(bought) ?? null) : null
+    ].filter(Boolean)
+    const settlementSet = new Set(settlementKeys.map(key => key.toXDR('base64')))
     //entries the settlement writes for each maker, tagged with the maker
     const makerOf = new Map()
     const makerKeys = []
@@ -246,38 +282,47 @@ export async function completeFootprint(tx, contractId, orderIds, {server, token
         for (const key of keys) {
             if (!key)
                 continue
-            makerOf.set(key.toXDR('base64'), owner)
+            const encoded = key.toXDR('base64')
+            if (settlementSet.has(encoded))
+                continue //declared with the settlement entries
+            makerOf.set(encoded, owner)
             makerKeys.push(key)
         }
     }
     const data = tx.simulation.transactionData
     //entries promoted from the read-only part are already counted as disk reads by the simulation
     const readOnly = new Set(data.getReadOnly().map(key => key.toXDR('base64')))
-    const added = declareReadWrite(data, [...orderKeys, ...makerKeys])
+    const added = declareReadWrite(data, [...orderKeys, ...settlementKeys, ...makerKeys])
     if (!added.length)
-        return {orders: 0, makerEntries: 0}
+        return {orders: 0, settlementEntries: 0, makerEntries: 0}
     const makers = new Set()
     let makerEntries = 0
+    let settlementEntries = 0
     let diskEntries = 0
     for (const key of added) {
         const encoded = key.toXDR('base64')
-        const maker = makerOf.get(encoded)
-        if (maker === undefined)
+        if (settlementSet.has(encoded)) {
+            settlementEntries++
+        } else if (makerOf.has(encoded)) {
+            makerEntries++
+            makers.add(makerOf.get(encoded))
+        } else
             continue
-        makerEntries++
-        makers.add(maker)
         if (DISK_ENTRY_TYPES.has(key.type) && !readOnly.has(encoded)) {
             diskEntries++
         }
     }
-    const orderEntries = added.length - makerEntries
+    const orderEntries = added.length - makerEntries - settlementEntries
+    //the forwarding transfer runs only when something settles, which the simulation did not see
+    const forward = settlementEntries > 0 ? 1 : 0
     applyResources(tx, data, {
-        instructions: orderEntries * ORDER_INSTRUCTIONS + makers.size * MAKER_INSTRUCTIONS,
+        instructions: orderEntries * ORDER_INSTRUCTIONS + makers.size * MAKER_INSTRUCTIONS + forward * FORWARD_INSTRUCTIONS,
         diskReadBytes: diskEntries * MAKER_ENTRY_SIZE,
-        writeBytes: orderEntries * ORDER_ENTRY_SIZE + makerEntries * MAKER_ENTRY_SIZE,
-        fee: BigInt(orderEntries) * ORDER_RESOURCE_FEE + BigInt(makerEntries) * MAKER_ENTRY_RESOURCE_FEE + BigInt(makers.size) * MAKER_RESOURCE_FEE
+        writeBytes: orderEntries * ORDER_ENTRY_SIZE + (makerEntries + settlementEntries) * MAKER_ENTRY_SIZE,
+        fee: BigInt(orderEntries) * ORDER_RESOURCE_FEE + BigInt(makerEntries + settlementEntries) * MAKER_ENTRY_RESOURCE_FEE +
+            BigInt(makers.size) * MAKER_RESOURCE_FEE + BigInt(forward) * FORWARD_RESOURCE_FEE
     })
-    return {orders: orderEntries, makerEntries}
+    return {orders: orderEntries, settlementEntries, makerEntries}
 }
 
 /**
@@ -416,4 +461,9 @@ function applyResources(tx, data, {instructions, diskReadBytes = 0, writeBytes, 
  * @property {rpc.Server} server - RPC server used to load the listed orders and the token instances
  * @property {string[]} [tokens] - Tokens the call trades, resolved together with the orders
  * @property {Map<string, Asset|null>} [assetCache] - Classic assets of resolved tokens (`null` for other tokens), reused between calls
+ * @property {string[]} [passThrough] - Tokens the call moves through the DEX contract's own balance: the bought asset of a
+ * trade, every hop asset of a swap
+ * @property {string} [receiver] - Account the bought asset is forwarded to (the trader, or the crossfill caller paid the surplus)
+ * @property {string} [bought] - Token the receiver gets (the taker order's `buying` by default for a crossfill)
+ * @property {bigint|number|string} [takerOrder] - Taker order of a crossfill: the asset it buys passes through the contract
  */

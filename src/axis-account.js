@@ -29,7 +29,7 @@ const LOCAL_ORDER_TTL = 120_000
  * - `backing` `{asset, backing}` - the balance, allowance or the backing split of the orders selling a token changed
  * - `approve` `{asset, amount, liveUntil}` - a trading call is about to grant an allowance
  * - `trade` {ApiTrade} - the account performed a trade
- * - `swap` - the account performed a swap
+ * - `swap` {ApiSwap} - the account performed a swap
  * - `change` - the open orders or the backing changed
  * - `error` `Error` - the push API rejected the account subscription
  */
@@ -148,7 +148,7 @@ export class AxisAccount extends Emitter {
 
     /**
      * Retrieve open orders, newest first
-     * @param {{market?: string|{a: string, b: string}|string[], selling?: string, buying?: string}} [filter] - `market` is an {AxisMarket} or a pair of assets in any order
+     * @param {{market?: string|{base: string, quote: string}|string[], selling?: string, buying?: string}} [filter] - `market` is an {AxisMarket} or a pair of assets in any order
      * @return {AccountOrder[]}
      */
     getOrders({market, selling, buying} = {}) { //TODO: simplify market argument
@@ -266,6 +266,26 @@ export class AxisAccount extends Emitter {
     }
 
     /**
+     * Simulate a sell with the same crossing and approval as `sell`, without signing or submitting it
+     * @param {TradeParams} params - Same as `sell`
+     * @return {Promise<import('./index.js').TradeEstimate>} - Network fee and expected result
+     */
+    async estimateSell(params) {
+        const {payload} = await this.prepareTrade(TradeDirection.Sell, params)
+        return this.client().estimateSell(payload)
+    }
+
+    /**
+     * Simulate a buy with the same crossing and approval as `buy`, without signing or submitting it
+     * @param {TradeParams} params - Same as `buy`
+     * @return {Promise<import('./index.js').TradeEstimate>} - Network fee and expected result
+     */
+    async estimateBuy(params) {
+        const {payload} = await this.prepareTrade(TradeDirection.Buy, params)
+        return this.client().estimateBuy(payload)
+    }
+
+    /**
      * Change the amount, price or expiration of open orders (omitted fields keep their current values)
      * @param {Array<{id: bigint|string, amount?: bigint, price?: bigint, expires?: number}>} updates
      * @return {Promise<bigint[]>} - Updated order ids
@@ -332,7 +352,7 @@ export class AxisAccount extends Emitter {
 
     /**
      * Cancel all open orders
-     * @param {{market?: string|{a: string, b: string}|string[]}} [filter]
+     * @param {{market?: string|{base: string, quote: string}|string[]}} [filter]
      * @return {Promise<string[]>} - Canceled order ids
      */
     async cancelAll({market} = {}) {
@@ -362,7 +382,7 @@ export class AxisAccount extends Emitter {
     }
 
     /**
-     * Swap across one or several markets along the best route found by the Aggregator
+     * Swap across one or several markets along the best route found by the AXIS API
      * @param {SwapParams} params
      * @return {Promise<{sold: bigint, bought: bigint, approve?: import('./index.js').Approval}>}
      */
@@ -454,7 +474,33 @@ export class AxisAccount extends Emitter {
      * @return {Promise<TradeResult>}
      * @private
      */
-    async trade(direction, {selling, buying, amount, price, kind, expires, orders, approve}) {
+    async trade(direction, params) {
+        const {payload, planned} = await this.prepareTrade(direction, params)
+        const {selling, buying, amount, price, expires, approve} = payload
+        if (planned && approve) {
+            this.emit('approve', {asset: selling, ...approve})
+        }
+        const client = this.client()
+        const [sold, bought, createdId] = direction === TradeDirection.Buy ?
+            await client.buy(payload) :
+            await client.sell(payload)
+        this.spent.set(selling, Date.now())
+        let order
+        if (createdId) {
+            order = await this.trackCreated(createdId, {direction, selling, buying, amount, price, sold, bought, expires})
+        }
+        return {sold, bought, orderId: createdId ? createdId.toString() : undefined, order, approve}
+    }
+
+    /**
+     * Resolve the crossing orders, the price of a market order and the approval of a trade
+     * @param {number} direction
+     * @param {TradeParams} params
+     * @return {Promise<{payload: import('./index.js').TradeArguments, planned: boolean}>} - Contract call arguments,
+     * `planned` if the approval was planned by the account rather than supplied
+     * @private
+     */
+    async prepareTrade(direction, {selling, buying, amount, price, kind, expires, orders, approve}) {
         await this.whenReady()
         amount = BigInt(amount)
         const market = price === undefined || price === null
@@ -463,7 +509,10 @@ export class AxisAccount extends Emitter {
         }
         let crossing
         if (!orders || market) {
-            crossing = await this.findQuote(direction, selling, buying, amount)
+            //a limit order crosses only the orders its price reaches (the contract threshold: the price of a buy, the
+            //inverted price of a sell) and rests with the remainder, so a partial crossing is quoted as well
+            const maxPrice = market ? undefined : direction === TradeDirection.Buy ? BigInt(price) : invertPrice(BigInt(price))
+            crossing = await this.findQuote(direction, selling, buying, amount, maxPrice)
         }
         if (market) {
             //cross everything the quote found: the limit is the worst maker price (makers price `selling` per
@@ -473,14 +522,11 @@ export class AxisAccount extends Emitter {
             price = direction === TradeDirection.Buy ? crossing.worstPrice : invertPrice(crossing.worstPrice)
         }
         price = BigInt(price)
-        if (approve === undefined) {
+        const planned = approve === undefined
+        if (planned) {
             const required = direction === TradeDirection.Buy ? maxQuoteSpend(amount, price) : amount
             approve = await this.planApproval(selling, required)
-            if (approve) {
-                this.emit('approve', {asset: selling, ...approve})
-            }
         }
-        const client = this.client()
         const payload = {
             kind,
             trader: this.address,
@@ -492,15 +538,7 @@ export class AxisAccount extends Emitter {
             expires,
             approve: approve || undefined
         }
-        const [sold, bought, createdId] = direction === TradeDirection.Buy ?
-            await client.buy(payload) :
-            await client.sell(payload)
-        this.spent.set(selling, Date.now())
-        let order
-        if (createdId) {
-            order = await this.trackCreated(createdId, {direction, selling, buying, amount, price, sold, bought, expires})
-        }
-        return {sold, bought, orderId: createdId ? createdId.toString() : undefined, order, approve: approve || undefined}
+        return {payload, planned}
     }
 
     /**
@@ -569,11 +607,12 @@ export class AxisAccount extends Emitter {
      * @param {string} selling
      * @param {string} buying
      * @param {bigint} amount - `selling` amount of a sell, `buying` amount of a buy
+     * @param {bigint} [maxPrice] - Highest maker price to cross, for a limit order
      * @return {Promise<{orders: string[], worstPrice: bigint|null}>}
      * @private
      */
-    async findQuote(direction, selling, buying, amount) {
-        const params = {sellingAsset: selling, buyingAsset: buying, amount: amount.toString(), direct: true}
+    async findQuote(direction, selling, buying, amount, maxPrice) {
+        const params = {sellingAsset: selling, buyingAsset: buying, amount: amount.toString(), direct: true, maxPrice}
         try {
             const quote = direction === TradeDirection.Buy ?
                 await this.axis.api.quoteBuy(params) :
@@ -610,7 +649,7 @@ export class AxisAccount extends Emitter {
             await Promise.race([
                 this.ready,
                 new Promise((resolve, reject) => {
-                    timer = setTimeout(() => reject(new Error('The account state is not available: check the Aggregator connection')), timeout)
+                    timer = setTimeout(() => reject(new Error('The account state is not available: check the AXIS API connection')), timeout)
                 })
             ])
         } finally {
@@ -853,7 +892,7 @@ function share(part, total) {
 }
 
 /**
- * @param {string|{a: string, b: string}|string[]|undefined} market
+ * @param {string|{base: string, quote: string}|string[]|undefined} market
  * @return {string|undefined}
  */
 function toMarketKey(market) {
@@ -865,7 +904,7 @@ function toMarketKey(market) {
     }
     if (Array.isArray(market))
         return pairKey(market[0], market[1])
-    return pairKey(market.a, market.b)
+    return pairKey(market.base, market.quote)
 }
 
 /**

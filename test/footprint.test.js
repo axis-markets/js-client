@@ -22,6 +22,8 @@ import {
     ensureOrdersFootprint,
     instanceLedgerKey,
     orderLedgerKey,
+    FORWARD_INSTRUCTIONS,
+    FORWARD_RESOURCE_FEE,
     MAKER_ENTRY_RESOURCE_FEE,
     MAKER_ENTRY_SIZE,
     MAKER_INSTRUCTIONS,
@@ -415,7 +417,7 @@ describe('completeFootprint', () => {
         const server = mockServer([orderEntry(1n, MAKER, USDC_TOKEN, XLM_TOKEN), ...tokenEntries()])
         const tx = dexTx([instanceKey()])
         const added = await completeFootprint(tx, DEX, [1n], {server, tokens: [XLM_TOKEN, USDC_TOKEN]})
-        expect(added).toEqual({orders: 1, makerEntries: 3})
+        expect(added).toEqual({orders: 1, settlementEntries: 0, makerEntries: 3})
         const fp = footprintOf(tx)
         expect(fp.readOnly.map(encode)).toEqual([encode(instanceKey())])
         expect(fp.readWrite.map(encode)).toEqual([
@@ -452,7 +454,7 @@ describe('completeFootprint', () => {
         const server = mockServer([orderEntry(1n, ISSUER, USDC_TOKEN, XLM_TOKEN), ...tokenEntries()])
         const tx = dexTx()
         const added = await completeFootprint(tx, DEX, [1n], {server})
-        expect(added).toEqual({orders: 1, makerEntries: 2})
+        expect(added).toEqual({orders: 1, settlementEntries: 0, makerEntries: 2})
         expect(footprintOf(tx).readWrite.map(encode)).toEqual([
             encode(orderLedgerKey(DEX, 1n)),
             encode(allowanceLedgerKey(ISSUER, USDC_TOKEN, DEX)),
@@ -468,7 +470,7 @@ describe('completeFootprint', () => {
         ])
         const tx = dexTx()
         const added = await completeFootprint(tx, DEX, [1n, 2n], {server})
-        expect(added).toEqual({orders: 2, makerEntries: 3})
+        expect(added).toEqual({orders: 2, settlementEntries: 0, makerEntries: 3})
         const data = tx.simulation.transactionData.build()
         expect(data.resources.instructions).toBe(SIM_INSTRUCTIONS + 2 * ORDER_INSTRUCTIONS + MAKER_INSTRUCTIONS)
         expect(data.resourceFee).toBe(BigInt(SIM_RESOURCE_FEE) + 2n * ORDER_RESOURCE_FEE + 3n * MAKER_ENTRY_RESOURCE_FEE + MAKER_RESOURCE_FEE)
@@ -478,7 +480,7 @@ describe('completeFootprint', () => {
         const server = mockServer([orderEntry(1n, MAKER, USDC_TOKEN, CUSTOM_TOKEN), ...tokenEntries()])
         const tx = dexTx()
         const added = await completeFootprint(tx, DEX, [1n], {server})
-        expect(added).toEqual({orders: 1, makerEntries: 2})
+        expect(added).toEqual({orders: 1, settlementEntries: 0, makerEntries: 2})
         expect(footprintOf(tx).readWrite.map(encode)).toEqual([
             encode(orderLedgerKey(DEX, 1n)),
             encode(trustline(MAKER, USDC)),
@@ -490,7 +492,7 @@ describe('completeFootprint', () => {
         const server = mockServer([orderEntry(1n, MAKER, USDC_TOKEN, XLM_TOKEN), ...tokenEntries()])
         const tx = dexTx([instanceKey(), trustline(MAKER, USDC)], [orderLedgerKey(DEX, 1n)])
         const added = await completeFootprint(tx, DEX, [1n], {server})
-        expect(added).toEqual({orders: 0, makerEntries: 3})
+        expect(added).toEqual({orders: 0, settlementEntries: 0, makerEntries: 3})
         const fp = footprintOf(tx)
         expect(fp.readOnly.map(encode)).toEqual([encode(instanceKey())])
         expect(fp.readWrite.map(encode)).toContain(encode(trustline(MAKER, USDC)))
@@ -501,14 +503,14 @@ describe('completeFootprint', () => {
     test('adds no disk reads for maker entries the simulation declared read-write', async () => {
         const server = mockServer([orderEntry(1n, MAKER, USDC_TOKEN, XLM_TOKEN), ...tokenEntries()])
         const tx = dexTx([instanceKey()], [orderLedgerKey(DEX, 1n), trustline(MAKER, USDC), allowanceLedgerKey(MAKER, USDC_TOKEN, DEX), accountEntryKey(MAKER)])
-        expect(await completeFootprint(tx, DEX, [1n], {server})).toEqual({orders: 0, makerEntries: 0})
+        expect(await completeFootprint(tx, DEX, [1n], {server})).toEqual({orders: 0, settlementEntries: 0, makerEntries: 0})
         expect(tx.simulation.transactionData.build().resources.diskReadBytes).toBe(0)
     })
 
     test('declares only the order entry of a missing order', async () => {
         const server = mockServer(tokenEntries())
         const tx = dexTx()
-        expect(await completeFootprint(tx, DEX, [9n], {server})).toEqual({orders: 1, makerEntries: 0})
+        expect(await completeFootprint(tx, DEX, [9n], {server})).toEqual({orders: 1, settlementEntries: 0, makerEntries: 0})
         expect(footprintOf(tx).readWrite.map(encode)).toEqual([encode(orderLedgerKey(DEX, 9n))])
     })
 
@@ -531,17 +533,63 @@ describe('completeFootprint', () => {
         const filler = Array.from({length: 198}, (_, i) => orderLedgerKey(CONTRACT, 1000n + BigInt(i)))
         const tx = dexTx([], filler)
         const added = await completeFootprint(tx, DEX, [1n], {server})
-        expect(added).toEqual({orders: 1, makerEntries: 1})
+        expect(added).toEqual({orders: 1, settlementEntries: 0, makerEntries: 1})
         const readWrite = footprintOf(tx).readWrite.map(encode)
         expect(readWrite).toHaveLength(200)
         expect(readWrite.slice(-2)).toEqual([encode(orderLedgerKey(DEX, 1n)), encode(trustline(MAKER, USDC))])
     })
 
+    test('declares the contract balance of the bought asset and the receiver balance before the maker entries', async () => {
+        //the taker sells XLM for USDC: makers deliver USDC to the DEX contract, which forwards it to the taker
+        const taker = Keypair.fromRawEd25519Seed(new Uint8Array(32).fill(9)).publicKey()
+        const server = mockServer([orderEntry(1n, MAKER, USDC_TOKEN, XLM_TOKEN), ...tokenEntries()])
+        const tx = dexTx()
+        const added = await completeFootprint(tx, DEX, [1n], {server, tokens: [XLM_TOKEN, USDC_TOKEN], passThrough: [USDC_TOKEN], receiver: taker, bought: USDC_TOKEN})
+        expect(added).toEqual({orders: 1, settlementEntries: 2, makerEntries: 3})
+        expect(footprintOf(tx).readWrite.map(encode)).toEqual([
+            encode(orderLedgerKey(DEX, 1n)),
+            encode(balanceLedgerKey(DEX, USDC_TOKEN, USDC)),
+            encode(trustline(taker, USDC)),
+            encode(trustline(MAKER, USDC)),
+            encode(allowanceLedgerKey(MAKER, USDC_TOKEN, DEX)),
+            encode(accountEntryKey(MAKER))
+        ])
+        const data = tx.simulation.transactionData.build()
+        expect(data.resources.instructions).toBe(SIM_INSTRUCTIONS + ORDER_INSTRUCTIONS + MAKER_INSTRUCTIONS + FORWARD_INSTRUCTIONS)
+        expect(data.resources.writeBytes).toBe(SIM_WRITE_BYTES + ORDER_ENTRY_SIZE + 5 * MAKER_ENTRY_SIZE)
+        //the trustlines and the maker account are disk reads, the contract balance is contract data
+        expect(data.resources.diskReadBytes).toBe(3 * MAKER_ENTRY_SIZE)
+        expect(data.resourceFee).toBe(BigInt(SIM_RESOURCE_FEE) + ORDER_RESOURCE_FEE + 5n * MAKER_ENTRY_RESOURCE_FEE + MAKER_RESOURCE_FEE + FORWARD_RESOURCE_FEE)
+    })
+
+    test('a crossfill passes the asset its taker order buys through the contract', async () => {
+        const caller = Keypair.fromRawEd25519Seed(new Uint8Array(32).fill(8)).publicKey()
+        //the taker order sells XLM for USDC, the maker order sells USDC for XLM
+        const server = mockServer([
+            orderEntry(1n, CONTRACT_MAKER, XLM_TOKEN, USDC_TOKEN),
+            orderEntry(2n, MAKER, USDC_TOKEN, XLM_TOKEN),
+            ...tokenEntries()
+        ])
+        const tx = dexTx()
+        const added = await completeFootprint(tx, DEX, [1n, 2n], {server, takerOrder: 1n, receiver: caller})
+        expect(added.settlementEntries).toBe(2)
+        const readWrite = footprintOf(tx).readWrite.map(encode)
+        expect(readWrite.slice(2, 4)).toEqual([encode(balanceLedgerKey(DEX, USDC_TOKEN, USDC)), encode(trustline(caller, USDC))])
+    })
+
+    test('a swap passes every hop asset through the contract, a token of unknown layout adds nothing', async () => {
+        const server = mockServer([orderEntry(1n, MAKER, USDC_TOKEN, XLM_TOKEN), ...tokenEntries()])
+        const tx = dexTx()
+        const added = await completeFootprint(tx, DEX, [1n], {server, passThrough: [USDC_TOKEN, CUSTOM_TOKEN], receiver: MAKER, bought: CUSTOM_TOKEN})
+        expect(added.settlementEntries).toBe(1)
+        expect(footprintOf(tx).readWrite.map(encode)).toContain(encode(balanceLedgerKey(DEX, USDC_TOKEN, USDC)))
+    })
+
     test('does nothing without ids or for failed simulations', async () => {
         const server = mockServer(tokenEntries())
-        expect(await completeFootprint(dexTx(), DEX, [], {server})).toEqual({orders: 0, makerEntries: 0})
+        expect(await completeFootprint(dexTx(), DEX, [], {server})).toEqual({orders: 0, settlementEntries: 0, makerEntries: 0})
         const failed = {simulation: {error: 'boom'}, built: dexTx().built}
-        expect(await completeFootprint(failed, DEX, [1n], {server})).toEqual({orders: 0, makerEntries: 0})
+        expect(await completeFootprint(failed, DEX, [1n], {server})).toEqual({orders: 0, settlementEntries: 0, makerEntries: 0})
         expect(server.requests).toHaveLength(0)
     })
 })

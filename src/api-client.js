@@ -1,5 +1,5 @@
 /**
- * Error thrown when the Aggregator API responds with a non-success HTTP status
+ * Error thrown when the AXIS API responds with a non-success HTTP status
  */
 export class AxisApiError extends Error {
     /**
@@ -21,21 +21,21 @@ export class AxisApiError extends Error {
 }
 
 /**
- * HTTP client for the AXIS Aggregator REST API
+ * HTTP client for the AXIS REST API
  */
 export class AxisApiClient {
     /**
-     * @param {string} serverUrl - Base URL of the Aggregator server
+     * @param {string} serverUrl - Base URL of the AXIS API server
      */
     constructor(serverUrl) {
         if (!serverUrl || typeof serverUrl !== 'string')
-            throw new TypeError('Aggregator server URL is required')
+            throw new TypeError('AXIS API server URL is required')
         //trim trailing slashes to avoid double slashes when building request paths
         this.serverUrl = serverUrl.replace(/\/+$/, '')
     }
 
     /**
-     * Base URL of the Aggregator server
+     * Base URL of the AXIS API server
      * @type {string}
      * @readonly
      */
@@ -45,7 +45,8 @@ export class AxisApiClient {
      * Price quote and candidate trade routes for selling a fixed amount of the source asset
      * @param {QuoteParams} params - Quote request parameters
      * @return {Promise<QuoteResult>} - Best routes ranked by profitability
-     * @throws {AxisApiError} - If the server is not ready or there is not enough liquidity
+     * @throws {AxisApiError} - 409 if the server is not ready or routing fails, 400 on invalid parameters. Not enough
+     * liquidity resolves with `status: 'unfeasible'`, a frozen contract with `status: 'rejected'`
      */
     async quoteSell(params) {
         return this.quote(params, 'strict_send')
@@ -55,7 +56,8 @@ export class AxisApiClient {
      * Price quote and candidate trade routes for buying a fixed amount of the destination asset
      * @param {QuoteParams} params - Quote request parameters
      * @return {Promise<QuoteResult>} - Best routes ranked by profitability
-     * @throws {AxisApiError} - If the server is not ready or there is not enough liquidity
+     * @throws {AxisApiError} - 409 if the server is not ready or routing fails, 400 on invalid parameters. Not enough
+     * liquidity resolves with `status: 'unfeasible'`, a frozen contract with `status: 'rejected'`
      */
     async quoteBuy(params) {
         return this.quote(params, 'strict_receive')
@@ -68,8 +70,8 @@ export class AxisApiClient {
      * @return {Promise<QuoteResult>}
      * @private
      */
-    async quote({sellingAsset, buyingAsset, amount, direct}, direction) {
-        return this.request('/quote', {sellingAsset, buyingAsset, amount, direction, direct})
+    async quote({sellingAsset, buyingAsset, amount, direct, maxPrice}, direction) {
+        return this.request('/quote', {sellingAsset, buyingAsset, amount, direction, direct, maxPrice: maxPrice?.toString()})
     }
 
     /**
@@ -154,16 +156,26 @@ export class AxisApiClient {
     }
 
     /**
-     * Retrieve recent trades
+     * Retrieve recent trades and swaps, newest first
      * @param {TradesParams} [params] - Filter parameters
-     * @return {Promise<ApiTrade[]>} - Recent trades matching the filter
+     * @return {Promise<Array<ApiTrade|ApiSwap>>} - Recent trades and swaps matching the filter (told apart by `type`)
      */
     async getTrades({trader, pair, cursor, limit} = {}) {
         return this.request('/trades', {trader, pair, cursor, limit})
     }
 
     /**
-     * Execute a GET request against the Aggregator API
+     * Failed AXIS calls, newest first (diagnostics: a failure changes no state, and a record never blames a party, see
+     * {@link ApiFailure})
+     * @param {FailuresParams} [params] - Filter parameters
+     * @return {Promise<ApiFailure[]>}
+     */
+    async getFailures({account, fn, cursor, limit} = {}) {
+        return this.request('/failures', {account, fn, cursor, limit})
+    }
+
+    /**
+     * Execute a GET request against the AXIS API
      * @param {string} path - Relative route path
      * @param {object} [query] - Query parameters (undefined/null values skipped, arrays expanded to repeated params)
      * @return {Promise<*>} - Parsed JSON response
@@ -208,6 +220,9 @@ export class AxisApiClient {
  * @property {string} buyingAsset - Asset to buy (same format as `sellingAsset`)
  * @property {string|number} amount - Trade amount in stroops (1 unit = 10,000,000 stroops)
  * @property {boolean} [direct] - Restrict to the direct market only (no intermediate-asset routes)
+ * @property {bigint|string} [maxPrice] - Highest maker price to cross (requires `direct`), in the units of a hop
+ * `worstPrice`: `sellingAsset` per unit of `buyingAsset`, scaled by 10^18. Quotes the crossing of a limit order: orders
+ * priced above it are left out and the route may trade less than `amount`
  */
 
 /**
@@ -318,14 +333,16 @@ export class AxisApiClient {
  * @typedef {{}} ContractInfoConfig
  * @property {string} safetyAdmin - Safety admin address
  * @property {string} oracle - Price oracle contract address
- * @property {string} marketListingFee - Fee token amount burned to open a market
+ * @property {number} [listingMinDays] - Days of price feeds a new market must buy (0 opens markets without a fee)
+ * @property {string} marketListingFee - Oracle fee tokens a market creator pays to provision the price feeds
  * @property {string} minTradeSize - Minimum trade value in USD with 7 decimals (0 = disabled)
+ * @property {number} [ledgerTime] - Expected ledger close time in seconds
  */
 
 /**
  * @typedef {{}} ContractInfoMarket
- * @property {string} a - First market asset
- * @property {string} b - Second market asset
+ * @property {string} base - Base market asset, the first of the pair in canonical order
+ * @property {string} quote - Quote market asset, the second of the pair in canonical order
  * @property {string} created - Creation timestamp (UTC)
  * @property {string} refreshed - Last oracle check timestamp (UTC)
  */
@@ -334,7 +351,7 @@ export class AxisApiClient {
  * @typedef {{}} OrdersParams
  * @property {string} [owner] - Filter by order owner address
  * @property {string|string[]} [asset] - Filter by asset(s) - every listed asset must be one of the order assets (two assets select a pair)
- * @property {string|bigint} [cursor] - Pagination cursor (order id)
+ * @property {string|bigint} [cursor] - `cursor` of the last order received (its creation position, not the order id)
  * @property {number|string} [limit] - Max orders to return
  */
 
@@ -342,7 +359,7 @@ export class AxisApiClient {
  * @typedef {{}} OrderHistoryParams
  * @property {string} [owner] - Filter by order owner address
  * @property {string[]} [pair] - Asset pair `[base, quote]` (contract ids)
- * @property {string|bigint} [cursor] - Pagination cursor (order id)
+ * @property {string|bigint} [cursor] - `cursor` of the last order received (its creation position, not the order id)
  * @property {number|string} [limit] - Max orders to return
  */
 
@@ -350,8 +367,40 @@ export class AxisApiClient {
  * @typedef {{}} TradesParams
  * @property {string} [trader] - Filter by trader address
  * @property {string[]} [pair] - Asset pair `[base, quote]` (contract ids)
- * @property {string|bigint} [cursor] - Pagination cursor (trade id)
+ * @property {string|bigint} [cursor] - `cursor` of the last record received (the trade or swap id)
  * @property {number|string} [limit] - Max trades to return
+ */
+
+/**
+ * @typedef {{}} FailuresParams
+ * @property {string} [account] - Caller of the failed transaction, or a party of the failed transfer
+ * @property {string} [fn] - Contract function (`trade`, `swap`, `crossfill`, `update`, ...)
+ * @property {string|bigint} [cursor] - `cursor` of the last record received
+ * @property {number|string} [limit] - Max records to return (20 by default, at most 500)
+ */
+
+/**
+ * @typedef {{}} ApiFailure - Failed AXIS call (made by the transaction or through another contract, the transaction failed
+ * or a calling contract caught the failure). It changes no state and blames no party:
+ * a token error on a settlement transfer does not tell the payer who could not pay from the recipient who could not be
+ * credited (e.g. a full trustline), and in a `crossfill` the makers are paid by the taker order owner, not the caller
+ * @property {'failure'} type - Record type
+ * @property {string} id - Record id (position of the transaction plus the index of the failed call)
+ * @property {string} txHash - Transaction hash
+ * @property {number} ledger - Ledger sequence
+ * @property {string} timestamp - Ledger close time (UTC)
+ * @property {string} fn - Contract function called
+ * @property {string} caller - The `trader` or `sponsor` argument, the transaction source for other functions
+ * @property {string[]} orders - Maker order ids listed by the call
+ * @property {string} [takerOrder] - Taker order id of a `crossfill`
+ * @property {string} result - Operation result code
+ * @property {boolean} [caught] - The transaction succeeded: a calling contract caught the failed AXIS call
+ * @property {'contract'|'transfer'|'resources'|'auth'|'unknown'} reason - `contract`: a contract error (`error`),
+ * `transfer`: a token transfer failed (`transfer`, either side may be at fault), `resources`: a resource limit, the
+ * refundable fee or an archived entry, `auth`: an authorization failure, `unknown`: no diagnostic events
+ * @property {{contract: string|null, code: number, name?: string}} [error] - Contract error that failed the call
+ * @property {{token: string, fn: string, from: string, to: string, amount: string}} [transfer] - Token transfer that failed
+ * @property {string} cursor - Pagination cursor
  */
 
 /**
@@ -392,6 +441,8 @@ export class AxisApiClient {
  * @property {number} liveUntil - Ledger sequence the allowance lives until
  * @property {boolean} authorized - Whether the account can send and receive the token
  * @property {string} budget - Effective budget, min(balance, allowance), 0 when unauthorized or expired
+ * @property {string} [headroom] - Amount the account can still receive (trustline limit minus balance and buying
+ * liabilities), omitted when unlimited or unknown
  * @property {string} [updated] - Last load timestamp (UTC)
  * @property {string} [skipped] - Last `skip` event of an order selling the token (UTC)
  * @property {boolean} [pending] - A reload confirming the latest event is still due
@@ -406,6 +457,20 @@ export class AxisApiClient {
  */
 
 /**
+ * @typedef {{}} ApiSwap - Serialized swap returned by the API, one per `swap` call
+ * @property {'swap'} type - Record type
+ * @property {string} id - Swap ID
+ * @property {string} trader - Trader address
+ * @property {string} soldAsset - Sold asset contract id
+ * @property {string} boughtAsset - Bought asset contract id
+ * @property {string} sold - Sold tokens amount
+ * @property {string} bought - Bought tokens amount
+ * @property {string} price - Approximate swap price
+ * @property {string} cursor - Pagination cursor
+ * @property {string} timestamp - Swap timestamp (UTC)
+ */
+
+/**
  * @typedef {{}} ApiTrade - Serialized trade returned by the API
  * @property {'trade'} type - Record type
  * @property {string} id - Trade ID
@@ -417,6 +482,8 @@ export class AxisApiClient {
  * @property {string} sold - Sold tokens amount
  * @property {string} bought - Bought tokens amount
  * @property {string} [left] - Order amount left after the fill
+ * @property {boolean} [crossfill] - The fill of a `crossfill` taker order: `taker` is the caller, paid the surplus, and the
+ * amounts mirror the makers' fills of the same call (left out of candles and volume)
  * @property {string} price - Approximate trade price
  * @property {string} [cursor] - Pagination cursor
  * @property {string} timestamp - Trade timestamp (UTC)

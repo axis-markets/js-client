@@ -7,31 +7,31 @@ import {parseApiDate} from './api-dates.js'
 export class AxisMarket {
     /**
      * @param {Axis} axis
-     * @param {{a: string, b: string, created?: string, refreshed?: string}} record - Market data
+     * @param {{base: string, quote: string, created?: string, refreshed?: string}} record - Market data
      */
     constructor(axis, record) {
         this.axis = axis
-        const [a, b] = canonicalPair(record.a, record.b)
-        this.a = a
-        this.b = b
-        this.key = a + '/' + b
+        const [base, quote] = canonicalPair(record.base, record.quote)
+        this.base = base
+        this.quote = quote
+        this.key = base + '/' + quote
         this.update(record)
     }
 
     /**
-     * Base asset
+     * Base asset, the first of the pair in the contract canonical order
      * @type {string}
      * @readonly
      */
-    a
+    base
     /**
-     * Quote asset
+     * Quote asset, the second of the pair in the contract canonical order
      * @type {string}
      * @readonly
      */
-    b
+    quote
     /**
-     * Canonical market key `a/b`
+     * Canonical market key `base/quote`
      * @type {string}
      * @readonly
      */
@@ -48,28 +48,12 @@ export class AxisMarket {
     refreshed = 0
 
     /**
-     * Base asset
-     * @return {string}
-     */
-    get base() {
-        return this.a
-    }
-
-    /**
-     * Quote asset
-     * @return {string}
-     */
-    get quote() {
-        return this.b
-    }
-
-    /**
      * Check whether the asset is one of the market assets
      * @param {string} asset
      * @return {boolean}
      */
     has(asset) {
-        return asset === this.a || asset === this.b
+        return asset === this.base || asset === this.quote
     }
 
     /**
@@ -78,10 +62,10 @@ export class AxisMarket {
      * @return {string}
      */
     counter(asset) {
-        if (asset === this.a)
-            return this.b
-        if (asset === this.b)
-            return this.a
+        if (asset === this.base)
+            return this.quote
+        if (asset === this.quote)
+            return this.base
         throw new Error(`Asset ${asset} does not belong to the market ${this.key}`)
     }
 
@@ -105,7 +89,7 @@ export class AxisMarket {
      * @return {Promise<Market|undefined>}
      */
     async requote(signer) {
-        return this.axis.contractClient(signer).requote(this.a, this.b)
+        return this.axis.contractClient(signer).requote(this.base, this.quote)
     }
 
     /**
@@ -115,7 +99,7 @@ export class AxisMarket {
      */
     async subsidize({amount, sponsor, signer}) {
         const client = this.axis.contractClient(signer)
-        return client.subsidize({sponsor: sponsor ?? client.publicKey, selling: this.a, buying: this.b, amount})
+        return client.subsidize({sponsor: sponsor ?? client.publicKey, selling: this.base, buying: this.quote, amount})
     }
 
     /**
@@ -123,7 +107,7 @@ export class AxisMarket {
      * @param {{base?: string, depth?: number, step?: string, limit?: number}} [params] - `base` is the base asset, `step` the price step (automatic by default)
      * @return {Promise<import('./api-client.js').OrderbookDepth>}
      */
-    async getDepth({base = this.a, depth, step, limit} = {}) {
+    async getDepth({base = this.base, depth, step, limit} = {}) {
         return this.axis.api.getDepth({market: base + '/' + this.counter(base), depth, step, limit})
     }
 
@@ -134,7 +118,7 @@ export class AxisMarket {
      * @param {function(OrderbookDepth): void} callback
      * @return {function(): void} - Unsubscribe function
      */
-    subscribeDepth({base = this.a, depth, step, limit} = {}, callback) {
+    subscribeDepth({base = this.base, depth, step, limit} = {}, callback) {
         const market = base + '/' + this.counter(base)
         return this.axis.stream.subscribe('depth', {market, depth, step, limit}, message => {
             if (message.type === 'depth') {
@@ -166,7 +150,7 @@ export class AxisMarket {
      * @param {function(Candle[], boolean): void} callback - Candles
      * @return {function(): void} - Unsubscribe function
      */
-    subscribeCandles({base = this.a, resolution, limit}, callback) {
+    subscribeCandles({base = this.base, resolution, limit}, callback) {
         const market = base + '/' + this.counter(base)
         return this.axis.stream.subscribe('candles', {market, resolution, limit}, message => {
             if (message.type === 'candles') {
@@ -186,7 +170,7 @@ export class AxisMarket {
     }
 
     toJSON() {
-        return {a: this.a, b: this.b, key: this.key, created: this.created, refreshed: this.refreshed}
+        return {base: this.base, quote: this.quote, key: this.key, created: this.created, refreshed: this.refreshed}
     }
 }
 

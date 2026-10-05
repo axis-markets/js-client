@@ -69,8 +69,8 @@ function mockFetch(routes) {
 const contractInfo = {
     frozen: false,
     markets: [
-        {a: USDC, b: XLM, created: '2026-09-01 00:00:00', refreshed: '2026-09-29 10:00:00'},
-        {a: EURC, b: CETES, created: '2026-09-01 00:00:00', refreshed: '2026-09-29 10:00:00'}
+        {base: USDC, quote: XLM, created: '2026-09-01 00:00:00', refreshed: '2026-09-29 10:00:00'},
+        {base: EURC, quote: CETES, created: '2026-09-01 00:00:00', refreshed: '2026-09-29 10:00:00'}
     ]
 }
 
@@ -110,6 +110,14 @@ function stubContract() {
         async buy(payload) {
             calls.push(['buy', payload])
             return stub.sellResult
+        },
+        async estimateSell(payload) {
+            calls.push(['estimateSell', payload])
+            return {fee: 600_000n, inclusionFee: 100_000n, resourceFee: 500_000n, sold: 0n, bought: 0n}
+        },
+        async estimateBuy(payload) {
+            calls.push(['estimateBuy', payload])
+            return {fee: 600_000n, inclusionFee: 100_000n, resourceFee: 500_000n, sold: 0n, bought: 0n}
         },
         async order(id) {
             calls.push(['order', id])
@@ -233,7 +241,7 @@ describe('Axis', () => {
         axis.on('market', e => markets.push(e.market.key))
         await axis.connect()
         expect(axis.getMarket(XLM, USDC).key).toBe(`${USDC}/${XLM}`)
-        expect(axis.getMarket(CETES, EURC)).toMatchObject({a: EURC, b: CETES})
+        expect(axis.getMarket(CETES, EURC)).toMatchObject({base: EURC, quote: CETES})
         expect(axis.getMarket(USDC, EURC)).toBeUndefined()
 
         const socket = latestSocket()
@@ -244,7 +252,7 @@ describe('Axis', () => {
         socket.push({type: 'contract', id: sub.id, topic: 'contract', data: contractInfo})
         socket.push({
             type: 'contract', topic: 'contract', kind: 'market',
-            data: {...contractInfo, frozen: true, markets: [...contractInfo.markets, {a: USDC, b: EURC, created: '2026-09-29 11:00:00', refreshed: '2026-09-29 11:00:00'}]}
+            data: {...contractInfo, frozen: true, markets: [...contractInfo.markets, {base: USDC, quote: EURC, created: '2026-09-29 11:00:00', refreshed: '2026-09-29 11:00:00'}]}
         })
         expect(frozen).toEqual([true])
         expect(axis.frozen).toBe(true)
@@ -393,6 +401,40 @@ describe('AxisAccount', () => {
         expect(events).toContainEqual(['approve', XLM])
         expect(events).toContainEqual(['pending', '55'])
         expect(tokens.reads).toBe(0)
+        axis.close()
+    })
+
+    test('a limit order quotes the crossing up to its price threshold', async () => {
+        const {account, calls, tokens, axis} = await setup([])
+        tokens.allowance = 10n ** 12n
+        const quoteParams = () => new URL(calls.filter(url => url.includes('/quote')).at(-1)).searchParams
+        //a sell crosses makers priced up to the inverted limit, like the contract
+        await account.sell({selling: XLM, buying: USDC, amount: 500_000_000n, price: P / 5n})
+        expect(quoteParams().get('direct')).toBe('true')
+        expect(quoteParams().get('maxPrice')).toBe((5n * P).toString())
+        //a buy crosses makers priced up to the limit itself
+        await account.buy({selling: USDC, buying: XLM, amount: 100n, price: P / 4n})
+        expect(quoteParams().get('maxPrice')).toBe((P / 4n).toString())
+        //a market order quotes the full amount without a limit
+        await account.buy({selling: USDC, buying: XLM, amount: 100n})
+        expect(quoteParams().has('maxPrice')).toBe(false)
+        axis.close()
+    })
+
+    test('a trade estimate simulates the same call without side effects', async () => {
+        const {account, contract, events, socket, topic, axis} = await setup()
+        socket.push({type: 'backing', topic, asset: XLM, backing: {...xlmBacking, allowance: '1000000000'}, backed: {'1': '1000000000'}})
+        const estimate = await account.estimateSell({selling: XLM, buying: USDC, amount: 500_000_000n, price: P / 5n})
+        expect(estimate.fee).toBe(600_000n)
+        const [, payload] = contract.calls.find(c => c[0] === 'estimateSell')
+        expect(payload).toMatchObject({kind: OrderKind.Limit, trader: TRADER, orders: [77n], price: P / 5n})
+        expect(payload.approve).toEqual({amount: 1_500_000_000n, liveUntil: 1000 + 518_400})
+        //nothing signed, no approval announced, nothing counted as spent
+        expect(contract.calls.some(c => c[0] === 'sell')).toBe(false)
+        expect(events).not.toContainEqual(['approve', XLM])
+        expect(account.spent.has(XLM)).toBe(false)
+        await account.estimateBuy({selling: USDC, buying: XLM, amount: 100n})
+        expect(contract.calls.find(c => c[0] === 'estimateBuy')[1]).toMatchObject({kind: OrderKind.Fill, price: P / 4n})
         axis.close()
     })
 

@@ -10,7 +10,8 @@ describe('ContractErrors', () => {
         const fromSpec = Object.fromEntries(client.spec.errorCases().map(entry => [entry.value, entry.name.toString()]))
         const fromClient = Object.fromEntries(Object.entries(ContractErrors).map(([code, err]) => [code, err.message]))
         expect(fromClient).toEqual(fromSpec)
-        expect(Object.keys(fromClient)).toHaveLength(17)
+        expect(Object.keys(fromClient)).toHaveLength(18)
+        expect(fromClient[712]).toBe('IntermediaryCannotReceive')
         expect(fromClient[707]).toBe('InvalidExpiration')
         expect(fromClient[740]).toBe('Overflow')
         expect(Object.values(fromClient)).not.toContain('MarketNotFound')
@@ -34,6 +35,48 @@ describe('processSimulationErrors', () => {
         expect(error).toBeInstanceOf(Error)
         expect(error.message).toBe('Contract execution error: #711 OrderExists')
         expect(error.code).toBe(711)
+    })
+
+    test('reports an error raised by a token transfer as a token error, blaming neither side', () => {
+        const token = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
+        const tx = {
+            options: {contractId: CONTRACT},
+            simulation: {
+                error: 'HostError: Error(Contract, #10)\n\nEvent log (newest first):\n' +
+                    `   0: [Diagnostic Event] contract:${CONTRACT}, topics:[error, Error(Contract, #10)], data:["contract call failed", transfer_from]\n` +
+                    `   1: [Diagnostic Event] contract:${token}, topics:[error, Error(Contract, #10)], data:"balance"\n` +
+                    //a maker transfer that failed earlier, caught by the contract (the maker was skipped)
+                    `   2: [Diagnostic Event] contract:${token}, topics:[error, Error(Contract, #11)], data:"deauthorized"\n`
+            }
+        }
+        let error
+        try {
+            processSimulationErrors(tx)
+        } catch (e) {
+            error = e
+        }
+        expect(error).toBeInstanceOf(Error)
+        expect(error).toMatchObject({code: 10, tokenError: true, contract: token})
+        expect(error.message).toContain('BalanceError')
+        expect(error.message).toContain('Either side')
+    })
+
+    test('a DEX error stays a contract error even when a caught token error preceded it', () => {
+        const token = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
+        const tx = {
+            options: {contractId: CONTRACT},
+            simulation: {
+                error: 'HostError: Error(Contract, #708)\n\nEvent log (newest first):\n' +
+                    `   0: [Diagnostic Event] contract:${CONTRACT}, topics:[error, Error(Contract, #708)], data:"escalating"\n` +
+                    `   1: [Diagnostic Event] contract:${token}, topics:[error, Error(Contract, #10)], data:"limit"\n`
+            }
+        }
+        expect(() => processSimulationErrors(tx)).toThrow('Contract execution error: #708 CannotReceive')
+        //without an event log, a code of the Stellar Asset Contract is a token error
+        const bare = {simulation: {error: 'HostError: Error(Contract, #9)'}}
+        expect(() => processSimulationErrors(bare)).toThrow(expect.objectContaining({code: 9, tokenError: true}))
+        const axis = {simulation: {error: 'HostError: Error(Contract, #712)'}}
+        expect(() => processSimulationErrors(axis)).toThrow('Contract execution error: #712 IntermediaryCannotReceive')
     })
 
     test('rethrows unknown simulation errors as-is', () => {
