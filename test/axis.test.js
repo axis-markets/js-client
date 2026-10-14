@@ -189,11 +189,15 @@ describe('canonical pair order', () => {
 describe('planApproval', () => {
     test('covers the call plus the committed orders, only when short', () => {
         expect(planApproval({required: 10n, committed: 90n, allowance: 100n, ledger: 1})).toBeUndefined()
-        expect(planApproval({required: 11n, committed: 90n, allowance: 100n, ledger: 1})).toEqual({amount: 101n, liveUntil: 1 + 518_400})
+        expect(planApproval({required: 11n, committed: 90n, allowance: 100n, ledger: 1})).toEqual({amount: 101n, liveUntil: 1 + 3_110_400})
     })
 
     test('renews an allowance about to expire', () => {
-        expect(planApproval({required: 1n, committed: 0n, allowance: 100n, liveUntil: 2000, ledger: 1000})).toEqual({amount: 1n, liveUntil: 1000 + 518_400})
+        expect(planApproval({required: 1n, committed: 0n, allowance: 100n, liveUntil: 2000, ledger: 1000})).toEqual({amount: 1n, liveUntil: 1000 + 3_110_400})
+    })
+
+    test('grants the requested lifetime', () => {
+        expect(planApproval({required: 1n, committed: 0n, allowance: 0n, ledger: 1000, ttl: 17_280})).toEqual({amount: 1n, liveUntil: 1000 + 17_280})
     })
 })
 
@@ -440,7 +444,7 @@ describe('AxisAccount', () => {
         const res = await account.sell({selling: XLM, buying: USDC, amount: 500_000_000n, price: P / 5n})
         const [, payload] = contract.calls.find(c => c[0] === 'sell')
         expect(payload).toMatchObject({kind: OrderKind.Limit, trader: TRADER, orders: [77n], price: P / 5n})
-        expect(payload.approve).toEqual({amount: 1_500_000_000n, liveUntil: 1000 + 518_400})
+        expect(payload.approve).toEqual({amount: 1_500_000_000n, liveUntil: 1000 + 3_110_400})
         expect(res).toMatchObject({orderId: '55', order: {id: '55', pending: true, amount: 500_000_000n}})
         //the unconfirmed order counts as committed until the indexer reports it
         expect(account.committed(XLM)).toBe(1_500_000_000n)
@@ -474,7 +478,7 @@ describe('AxisAccount', () => {
         expect(estimate.fee).toBe(600_000n)
         const [, payload] = contract.calls.find(c => c[0] === 'estimateSell')
         expect(payload).toMatchObject({kind: OrderKind.Limit, trader: TRADER, orders: [77n], price: P / 5n})
-        expect(payload.approve).toEqual({amount: 1_500_000_000n, liveUntil: 1000 + 518_400})
+        expect(payload.approve).toEqual({amount: 1_500_000_000n, liveUntil: 1000 + 3_110_400})
         //nothing signed, no approval announced, nothing counted as spent
         expect(contract.calls.some(c => c[0] === 'sell')).toBe(false)
         expect(events).not.toContainEqual(['approve', XLM])
@@ -509,7 +513,7 @@ describe('AxisAccount', () => {
         await account.update([{id: '1', amount: 1_200_000_000n}])
         const [, params] = contract.calls.find(c => c[0] === 'update')
         expect(params.updates).toEqual([{id: 1n, amount: 1_200_000_000n, price: P / 5n, expires: 0}])
-        expect(params.approvals).toEqual([{asset: XLM, amount: 1_200_000_000n, liveUntil: 1000 + 518_400}])
+        expect(params.approvals).toEqual([{asset: XLM, amount: 1_200_000_000n, liveUntil: 1000 + 3_110_400}])
         const canceled = await account.cancelAll({market: axis.getMarket(USDC, XLM)})
         expect(canceled).toEqual(['1'])
         expect(contract.calls.find(c => c[0] === 'cancel')).toEqual(['cancel', TRADER, [1n]])
@@ -542,7 +546,9 @@ describe('AxisAccount', () => {
         axis.tokenBalances = undefined
         axis.ledger = 1000
         account.spent.clear()
-        expect(await account.planApproval(XLM, 10_000_000_000n)).toEqual({amount: 11_000_000_000n, liveUntil: 1000 + 518_400})
+        expect(await account.planApproval(XLM, 10_000_000_000n)).toEqual({amount: 11_000_000_000n, liveUntil: 1000 + 3_110_400})
+        expect(axis.account(TRADER, {approvalTtl: 17_280})).toBe(account)
+        expect(await account.planApproval(XLM, 10_000_000_000n)).toEqual({amount: 11_000_000_000n, liveUntil: 1000 + 17_280})
         await expect(account.planApproval(EURC, 1n)).rejects.toThrow('rpcUrl')
         axis.close()
     })

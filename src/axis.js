@@ -251,17 +251,22 @@ export class Axis extends Emitter {
     /**
      * Trader wrapper tracking the orders and allowances for an account (one instance per account address)
      * @param {string} address - Trader address
-     * @param {{signTransaction: [SignTransactionCallback]}} [options] - Transaction signing callback
+     * @param {{signTransaction?: SignTransactionCallback, approvalTtl?: number}} [options] - Transaction signing callback and lifetime of the allowances granted by trading calls, in ledgers
      * @return {AxisAccount}
      */
-    account(address, {signTransaction} = {}) {
+    account(address, {signTransaction, approvalTtl} = {}) {
         let account = this.accounts.get(address)
         if (!account) {
-            account = new AxisAccount(this, address, {signTransaction})
+            account = new AxisAccount(this, address, {signTransaction, approvalTtl})
             this.accounts.set(address, account)
             account.start()
-        } else if (signTransaction) {
-            account.signTransaction = signTransaction
+        } else {
+            if (signTransaction) {
+                account.signTransaction = signTransaction
+            }
+            if (approvalTtl) {
+                account.approvalTtl = approvalTtl
+            }
         }
         return account
     }

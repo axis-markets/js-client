@@ -74,7 +74,8 @@ await account.swap({selling: USDC, buying: EURC, amount: 10_000_000n, direction:
 
 **Allowances.** The contract holds no funds: an order is fillable up to `min(balance, allowance)` in the sold token, and
 one allowance record backs every order selling it. Before each `sell`, `buy`, `swap` and a growing `update`, the account
-checks the allowance and attaches to cover all active orders. A fill lowers the allowance and the order it fills in the
+checks the allowance and attaches to cover all active orders. A new allowance lives `account.approvalTtl` ledgers
+(`APPROVAL_TTL_LEDGERS`, ~180 days, unless set with `axis.account(address, {approvalTtl})`). A fill lowers the allowance and the order it fills in the
 same pushed ledger, so the memory state stays consistent. The allowance is read over RPC only when the push connection
 is down, the token is not tracked, or for 30 s after this client spent the token as a taker (the push reporting the
 spend may lag behind). An order this client created counts as committed right away (`pending: true`) until the indexer
@@ -96,7 +97,7 @@ selling the token oldest first), `backedPct` and `backingPending`.
 | `frozen`, `config`, `markets`, `loaded` | Contract state; `markets` is a `Map` of `AxisMarket` by canonical key. |
 | `getMarket(x, y)` | Market of the asset pair in either order, `undefined` if not open. |
 | `getOrder(id)` | Live order from a tracked account's memory or the AXIS API, `undefined` if gone. |
-| `account(address, {signTransaction})` | `AxisAccount` of the trader (one per address). |
+| `account(address, {signTransaction, approvalTtl?})` | `AxisAccount` of the trader (one per address), `approvalTtl` sets the lifetime of the allowances it grants in ledgers. |
 | `subscribeTicker(cb)` | 24h ticker of every market (canonical orientation); also fills `market.ticker`. |
 | `keepalive({days?, signer?})` | Extend the contract instance and code lifetime, see `AxisContractClient.keepalive`. |
 | `close()` | Stop following the contract and every account. |
@@ -114,6 +115,7 @@ selling the token oldest first), `backedPct` and `backingPending`.
 | `AxisAccount` | Description |
 |---|---|
 | `orders`, `backing`, `ready`, `loaded` | Open orders by id and backing by token, in memory. |
+| `approvalTtl` | Lifetime of the allowances granted by trading calls, in ledgers (`APPROVAL_TTL_LEDGERS` by default). |
 | `balances`, `getBalance(asset)`, `funded` | Spendable balances by token (every market token), whether the account exists. |
 | `getOrders({market?, selling?, buying?})` | Open orders, newest first, including `pending` ones this client created. |
 | `getOrder(id)`, `committed(asset)`, `getAllowance(asset)` | Order lookup, open amount selling a token, allowance summary. |

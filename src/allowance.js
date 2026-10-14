@@ -1,9 +1,9 @@
 import {PRICE_SCALE} from './asset-pair.js'
 
 /**
- * Allowance lifetime granted with a trade, in ledgers: ~30 days at 5s per ledger (the maximum entry TTL ~180 days)
+ * Default allowance lifetime granted with a trade, in ledgers: ~180 days at 5s per ledger (the maximum entry TTL)
  */
-export const APPROVAL_TTL_LEDGERS = 518_400
+export const APPROVAL_TTL_LEDGERS = 3_110_400
 
 /**
  * An allowance expiring within this number of ledgers is renewed with the next trade (~1 day)
@@ -16,12 +16,12 @@ export const APPROVAL_RENEW_LEDGERS = 17_280
  * @param {ApprovalPlanParams} params
  * @return {{amount: bigint, liveUntil: number}|undefined} - Approval to pass with the call, undefined when the current allowance already covers it
  */
-export function planApproval({required, committed, allowance, liveUntil, ledger}) {
+export function planApproval({required, committed, allowance, liveUntil, ledger, ttl = APPROVAL_TTL_LEDGERS}) {
     const target = required + committed
     const expiring = liveUntil > 0 && liveUntil < ledger + APPROVAL_RENEW_LEDGERS
     if (allowance >= target && !expiring)
         return undefined //TODO: reduce outstanding allowances if the backed amount is reduced (expired or cancelled)
-    return {amount: target, liveUntil: ledger + APPROVAL_TTL_LEDGERS}
+    return {amount: target, liveUntil: ledger + ttl}
 }
 
 /**
@@ -43,4 +43,5 @@ export function maxQuoteSpend(amount, price) {
  * @property {bigint} allowance - Current allowance (0 once expired)
  * @property {number} ledger - Current ledger sequence
  * @property {number} [liveUntil] - Ledger the current allowance lives until (0 or omitted when unknown)
+ * @property {number} [ttl] - Lifetime of a new allowance in ledgers, {@link APPROVAL_TTL_LEDGERS} by default
  */

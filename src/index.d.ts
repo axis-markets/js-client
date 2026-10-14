@@ -1079,7 +1079,7 @@ export declare function invertTicker(entry: TickerEntry): TickerEntry;
  */
 export declare function parseApiDate(value: string | number | undefined): number;
 
-/** Allowance lifetime granted with a trade, in ledgers: ~30 days at 5s per ledger (the maximum entry TTL ~180 days) */
+/** Default allowance lifetime granted with a trade, in ledgers: ~180 days at 5s per ledger (the maximum entry TTL) */
 export declare const APPROVAL_TTL_LEDGERS: number;
 /** An allowance expiring within this number of ledgers is renewed with the next trade (~1 day) */
 export declare const APPROVAL_RENEW_LEDGERS: number;
@@ -1095,6 +1095,8 @@ export interface ApprovalPlanParams {
     ledger: number;
     /** Ledger the current allowance lives until (0 or omitted when unknown) */
     liveUntil?: number;
+    /** Lifetime of a new allowance in ledgers, `APPROVAL_TTL_LEDGERS` by default */
+    ttl?: number;
 }
 
 /**
@@ -1286,9 +1288,10 @@ export declare class Axis extends Emitter {
     /**
      * Trader wrapper tracking the orders and allowances for an account (one instance per account address)
      * @param address - Trader address
-     * @param options - Transaction signing callback
+     * @param options - Transaction signing callback and lifetime of the allowances granted by trading calls, in ledgers
+     * (`APPROVAL_TTL_LEDGERS` by default)
      */
-    account(address: string, options?: {signTransaction?: SignTransactionCallback}): AxisAccount;
+    account(address: string, options?: {signTransaction?: SignTransactionCallback, approvalTtl?: number}): AxisAccount;
     /**
      * Stream the 24h ticker of every market
      * Sends a full snapshot, then updates caused by trades
@@ -1537,6 +1540,8 @@ export declare class AxisAccount extends Emitter {
     readonly address: string;
     /** Wallet signing callback, required to trade */
     signTransaction?: SignTransactionCallback;
+    /** Lifetime of the allowances granted by trading calls, in ledgers (`APPROVAL_TTL_LEDGERS` by default) */
+    approvalTtl: number;
     /** Open orders by id */
     readonly orders: Map<string, AccountOrder>;
     /** Account backing by token contract id */

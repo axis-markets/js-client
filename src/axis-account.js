@@ -1,7 +1,7 @@
 import {Emitter} from './emitter.js'
 import {pairKey, invertPrice} from './asset-pair.js'
 import {parseApiDate} from './api-dates.js'
-import {planApproval, maxQuoteSpend} from './allowance.js'
+import {planApproval, maxQuoteSpend, APPROVAL_TTL_LEDGERS} from './allowance.js'
 import {OrderKind, TradeDirection} from './constants.js'
 
 /** Orders per `update` transaction  */
@@ -37,13 +37,14 @@ export class AxisAccount extends Emitter {
     /**
      * @param {Axis} axis
      * @param {string} address - Trader address
-     * @param {{signTransaction?: SignTransactionCallback}} [options]
+     * @param {{signTransaction?: SignTransactionCallback, approvalTtl?: number}} [options]
      */
-    constructor(axis, address, {signTransaction} = {}) {
+    constructor(axis, address, {signTransaction, approvalTtl} = {}) {
         super()
         this.axis = axis
         this.address = address
         this.signTransaction = signTransaction
+        this.approvalTtl = approvalTtl || APPROVAL_TTL_LEDGERS
         this.ready = new Promise(resolve => this.resolveReady = resolve)
     }
 
@@ -58,6 +59,11 @@ export class AxisAccount extends Emitter {
      * @type {SignTransactionCallback|undefined}
      */
     signTransaction
+    /**
+     * Lifetime of the allowances granted by trading calls, in ledgers
+     * @type {number}
+     */
+    approvalTtl
     /**
      * Open orders by id
      * @type {Map<string, AccountOrder>}
@@ -450,7 +456,8 @@ export class AxisAccount extends Emitter {
             committed: this.committed(asset),
             allowance,
             liveUntil: backing?.liveUntil ?? 0,
-            ledger: await this.axis.getLedger()
+            ledger: await this.axis.getLedger(),
+            ttl: this.approvalTtl
         })
     }
 
