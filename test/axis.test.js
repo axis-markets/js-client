@@ -1,4 +1,4 @@
-import {Axis, AxisStreamClient, OrderKind, TradeDirection, canonicalPair, pairKey, compareAssets, invertTicker, planApproval, parseApiDate} from '../src/index.js'
+import {Axis, AxisStreamClient, OrderKind, TradeDirection, canonicalPair, pairKey, compareAssets, invertTicker, planApproval, planReduction, parseApiDate, APPROVAL_TTL_LEDGERS, MAX_APPROVAL_TTL_LEDGERS} from '../src/index.js'
 
 const CONTRACT = 'CBJ747MKAGQO2LMJPOTCOONAWBLIIBSLOQE325R457TE5MIS6RTDJ4DC'
 const USDC = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA'
@@ -189,15 +189,39 @@ describe('canonical pair order', () => {
 describe('planApproval', () => {
     test('covers the call plus the committed orders, only when short', () => {
         expect(planApproval({required: 10n, committed: 90n, allowance: 100n, ledger: 1})).toBeUndefined()
-        expect(planApproval({required: 11n, committed: 90n, allowance: 100n, ledger: 1})).toEqual({amount: 101n, liveUntil: 1 + 3_110_400})
+        expect(planApproval({required: 11n, committed: 90n, allowance: 100n, ledger: 1})).toEqual({amount: 101n, liveUntil: 1 + APPROVAL_TTL_LEDGERS})
     })
 
     test('renews an allowance about to expire', () => {
-        expect(planApproval({required: 1n, committed: 0n, allowance: 100n, liveUntil: 2000, ledger: 1000})).toEqual({amount: 1n, liveUntil: 1000 + 3_110_400})
+        expect(planApproval({required: 1n, committed: 0n, allowance: 100n, liveUntil: 2000, ledger: 1000})).toEqual({amount: 1n, liveUntil: 1000 + APPROVAL_TTL_LEDGERS})
     })
 
     test('grants the requested lifetime', () => {
         expect(planApproval({required: 1n, committed: 0n, allowance: 0n, ledger: 1000, ttl: 17_280})).toEqual({amount: 1n, liveUntil: 1000 + 17_280})
+    })
+
+    test('stays short of the network maximum lifetime', () => {
+        expect(APPROVAL_TTL_LEDGERS).toBe(MAX_APPROVAL_TTL_LEDGERS)
+        expect(MAX_APPROVAL_TTL_LEDGERS).toBe(180 * 17_280 - 720)
+        expect(planApproval({required: 1n, committed: 0n, allowance: 0n, ledger: 1000, ttl: 3_110_400})).toEqual({amount: 1n, liveUntil: 1000 + MAX_APPROVAL_TTL_LEDGERS})
+    })
+})
+
+describe('planReduction', () => {
+    test('lowers an allowance above what the open orders need, keeping a long enough lifetime', () => {
+        expect(planReduction({target: 50n, allowance: 100n, liveUntil: 900_000, ledger: 1000})).toEqual({amount: 50n, liveUntil: 900_000})
+        expect(planReduction({target: 100n, allowance: 100n, liveUntil: 900_000, ledger: 1000})).toBeUndefined()
+        expect(planReduction({target: 150n, allowance: 100n, liveUntil: 900_000, ledger: 1000})).toBeUndefined()
+    })
+
+    test('revokes an allowance no order needs', () => {
+        expect(planReduction({target: 0n, allowance: 100n, liveUntil: 900_000, ledger: 1000})).toEqual({amount: 0n, liveUntil: 0})
+    })
+
+    test('renews a lifetime that ends soon or is unknown, and leaves an expired allowance alone', () => {
+        expect(planReduction({target: 50n, allowance: 100n, liveUntil: 2000, ledger: 1000})).toEqual({amount: 50n, liveUntil: 1000 + APPROVAL_TTL_LEDGERS})
+        expect(planReduction({target: 50n, allowance: 100n, ledger: 1000, ttl: 17_280})).toEqual({amount: 50n, liveUntil: 1000 + 17_280})
+        expect(planReduction({target: 0n, allowance: 100n, liveUntil: 999, ledger: 1000})).toBeUndefined()
     })
 })
 
@@ -444,7 +468,7 @@ describe('AxisAccount', () => {
         const res = await account.sell({selling: XLM, buying: USDC, amount: 500_000_000n, price: P / 5n})
         const [, payload] = contract.calls.find(c => c[0] === 'sell')
         expect(payload).toMatchObject({kind: OrderKind.Limit, trader: TRADER, orders: [77n], price: P / 5n})
-        expect(payload.approve).toEqual({amount: 1_500_000_000n, liveUntil: 1000 + 3_110_400})
+        expect(payload.approve).toEqual({amount: 1_500_000_000n, liveUntil: 1000 + APPROVAL_TTL_LEDGERS})
         expect(res).toMatchObject({orderId: '55', order: {id: '55', pending: true, amount: 500_000_000n}})
         //the unconfirmed order counts as committed until the indexer reports it
         expect(account.committed(XLM)).toBe(1_500_000_000n)
@@ -478,7 +502,7 @@ describe('AxisAccount', () => {
         expect(estimate.fee).toBe(600_000n)
         const [, payload] = contract.calls.find(c => c[0] === 'estimateSell')
         expect(payload).toMatchObject({kind: OrderKind.Limit, trader: TRADER, orders: [77n], price: P / 5n})
-        expect(payload.approve).toEqual({amount: 1_500_000_000n, liveUntil: 1000 + 3_110_400})
+        expect(payload.approve).toEqual({amount: 1_500_000_000n, liveUntil: 1000 + APPROVAL_TTL_LEDGERS})
         //nothing signed, no approval announced, nothing counted as spent
         expect(contract.calls.some(c => c[0] === 'sell')).toBe(false)
         expect(events).not.toContainEqual(['approve', XLM])
@@ -508,15 +532,162 @@ describe('AxisAccount', () => {
     })
 
     test('update raises the allowance by the extra commitment and cancelAll cancels a market', async () => {
-        const {account, contract, socket, topic, axis} = await setup()
+        const {account, contract, socket, topic, tokens, axis} = await setup()
         socket.push({type: 'backing', topic, asset: XLM, backing: {...xlmBacking, allowance: '1000000000'}, backed: {'1': '1000000000'}})
         await account.update([{id: '1', amount: 1_200_000_000n}])
         const [, params] = contract.calls.find(c => c[0] === 'update')
         expect(params.updates).toEqual([{id: 1n, amount: 1_200_000_000n, price: P / 5n, expires: 0}])
-        expect(params.approvals).toEqual([{asset: XLM, amount: 1_200_000_000n, liveUntil: 1000 + 3_110_400}])
+        expect(params.approvals).toEqual([{asset: XLM, amount: 1_200_000_000n, liveUntil: 1000 + APPROVAL_TTL_LEDGERS}])
+        //the change shows before the indexer reports it
+        expect(account.getOrder('1').amount).toBe(1_200_000_000n)
+        expect(account.getAllowance(XLM).allowance).toBe(1_200_000_000n)
+        //the approval is not pushed yet: the allowance is read on-chain
+        tokens.allowance = 1_200_000_000n
         const canceled = await account.cancelAll({market: axis.getMarket(USDC, XLM)})
         expect(canceled).toEqual(['1'])
-        expect(contract.calls.find(c => c[0] === 'cancel')).toEqual(['cancel', TRADER, [1n]])
+        expect(tokens.reads).toBe(1)
+        expect(contract.calls.at(-1)).toEqual(['update', {
+            trader: TRADER,
+            updates: [{id: 1n, amount: 0n, price: 0n, expires: 0}],
+            approvals: [{asset: XLM, amount: 0n, liveUntil: 0}]
+        }])
+        //gone from the open orders and no longer committed before the indexer reports the removal
+        expect(account.getOrders()).toEqual([])
+        expect(account.committed(XLM)).toBe(0n)
+        axis.close()
+    })
+
+    test('cancel lowers the allowance to what the remaining orders need', async () => {
+        const {account, contract, socket, topic, tokens, axis} = await setup([apiOrder(1), apiOrder(2, {amount: '500000000', cursor: '5'})])
+        await account.cancel(['1'])
+        expect(contract.calls.at(-1)).toEqual(['update', {
+            trader: TRADER,
+            updates: [{id: 1n, amount: 0n, price: 0n, expires: 0}],
+            //5000 XLM allowance, 50 XLM still on the book: lowered, the lifetime kept
+            approvals: [{asset: XLM, amount: 500_000_000n, liveUntil: 900_000}]
+        }])
+        expect(account.getAllowance(XLM)).toMatchObject({allowance: 500_000_000n, available: 500_000_000n, committed: 500_000_000n})
+        //a pushed record predating the call does not bring the old allowance back
+        socket.push({type: 'backing', topic, asset: XLM, backing: xlmBacking, backed: {}})
+        expect(account.getAllowance(XLM).allowance).toBe(500_000_000n)
+        //the last order revokes the allowance, read on-chain until the push confirms the change
+        tokens.allowance = 500_000_000n
+        await account.cancel(['2'])
+        expect(tokens.reads).toBe(1)
+        expect(contract.calls.at(-1)[1].approvals).toEqual([{asset: XLM, amount: 0n, liveUntil: 0}])
+        socket.push({type: 'backing', topic, asset: XLM, backing: {...xlmBacking, allowance: '0', budget: '0'}, backed: {}})
+        expect(account.isAllowanceCurrent(XLM)).toBe(true)
+        axis.close()
+    })
+
+    test('cancel plans every batch from the state before the first one', async () => {
+        const orders = Array.from({length: 200}, (_, i) => apiOrder(i + 1, {amount: '10', quote: '10', backed: '10', cursor: String(1000 - i)}))
+        const {account, contract, socket, topic, axis} = await setup(orders)
+        const ids = orders.map(order => order.id)
+        //the indexer reports each batch before the next one is planned
+        const update = contract.update
+        contract.update = async params => {
+            const res = await update(params)
+            for (const {id} of params.updates) {
+                socket.push({type: 'order', topic, action: 'cancel', order: apiOrder(Number(id), {status: 'CANCELED', amount: '10', quote: '10'})})
+            }
+            return res
+        }
+        await account.cancel(ids)
+        const batches = contract.calls.filter(c => c[0] === 'update').map(c => c[1])
+        //an approval takes the room of two removals
+        expect(batches.map(batch => batch.updates.length)).toEqual([88, 88, 24])
+        expect(batches.map(batch => batch.approvals.map(approval => approval.amount))).toEqual([[1120n], [240n], [0n]])
+        axis.close()
+    })
+
+    test('a declined batch leaves the allowance backing the orders it did not cancel', async () => {
+        const orders = Array.from({length: 100}, (_, i) => apiOrder(i + 1, {amount: '10', quote: '10', backed: '10', cursor: String(1000 - i)}))
+        const {account, contract, axis} = await setup(orders)
+        const update = contract.update
+        contract.update = async params => {
+            if (contract.calls.some(c => c[0] === 'update'))
+                throw new Error('Transaction rejected in wallet')
+            return update(params)
+        }
+        const error = await account.cancel(orders.map(order => order.id)).catch(e => e)
+        expect(error.message).toBe('Transaction rejected in wallet')
+        expect(error.progress).toMatchObject({batches: 1})
+        expect(contract.calls.find(c => c[0] === 'update')[1].approvals).toEqual([{asset: XLM, amount: 120n, liveUntil: 900_000}])
+        expect(account.getOrders()).toHaveLength(12)
+        axis.close()
+    })
+
+    test('cancel goes through without lowering an allowance it cannot read', async () => {
+        //expired: nothing to lower
+        const expired = await setup([apiOrder(1)])
+        expired.socket.push({type: 'backing', topic: expired.topic, asset: XLM, backing: {...xlmBacking, liveUntil: 500}, backed: {}})
+        await expired.account.cancel(['1'])
+        expect(expired.contract.calls.at(-1)[1].approvals).toEqual([])
+        expired.axis.close()
+        //no account state yet: plain removals
+        mockFetch({'/contract': contractInfo})
+        const {axis, contract} = createAxis()
+        const account = axis.account(TRADER, {signTransaction: async () => ({signedTxXdr: ''})})
+        await account.cancel(['7'])
+        expect(contract.calls).toEqual([['update', {trader: TRADER, updates: [{id: 7n, amount: 0n, price: 0n, expires: 0}], approvals: []}]])
+        axis.close()
+    })
+
+    test('update lowers the allowance of a shrunk order and backs a changed order the allowance does not cover', async () => {
+        const {account, contract, socket, topic, axis} = await setup()
+        await account.update([{id: '1', amount: 400_000_000n}])
+        expect(contract.calls.at(-1)[1].approvals).toEqual([{asset: XLM, amount: 400_000_000n, liveUntil: 900_000}])
+        //confirmed by the push
+        socket.push({type: 'backing', topic, asset: XLM, backing: {...xlmBacking, allowance: '400000000', budget: '400000000'}, backed: {}})
+        //a price change the allowance covers needs no approval
+        await account.update([{id: '1', price: P / 4n}])
+        expect(contract.calls.at(-1)[1]).toMatchObject({updates: [{id: 1n, amount: 400_000_000n, price: P / 4n, expires: 0}], approvals: []})
+        //a revoked allowance does not back the order: the contract would reject the change
+        socket.push({type: 'backing', topic, asset: XLM, backing: {...xlmBacking, allowance: '0', budget: '0'}, backed: {}})
+        await account.update([{id: '1', expires: 1_900_000_000}])
+        expect(contract.calls.at(-1)[1].approvals).toEqual([{asset: XLM, amount: 400_000_000n, liveUntil: 1000 + APPROVAL_TTL_LEDGERS}])
+        axis.close()
+    })
+
+    test('revoke sets allowances to zero, canceling the orders selling them on request', async () => {
+        const {account, contract, axis} = await setup([apiOrder(1), apiOrder(2, {selling: USDC, buying: XLM, cursor: '5'})])
+        expect(await account.revoke([XLM, USDC])).toEqual({revoked: [XLM, USDC], canceled: []})
+        expect(contract.calls.at(-1)).toEqual(['update', {
+            trader: TRADER,
+            updates: [],
+            approvals: [{asset: XLM, amount: 0n, liveUntil: 0}, {asset: USDC, amount: 0n, liveUntil: 0}]
+        }])
+        expect(account.getAllowance(XLM)).toMatchObject({allowance: 0n, available: 0n})
+        expect(account.getOrders()).toHaveLength(2)
+        expect(await account.revoke([XLM], {cancelOrders: true})).toEqual({revoked: [XLM], canceled: ['1']})
+        //one zero approval per revoked token, the revocation with the removals
+        expect(contract.calls.at(-1)).toEqual(['update', {
+            trader: TRADER,
+            updates: [{id: 1n, amount: 0n, price: 0n, expires: 0}],
+            approvals: [{asset: XLM, amount: 0n, liveUntil: 0}]
+        }])
+        expect(account.getOrders().map(order => order.id)).toEqual(['2'])
+        axis.close()
+    })
+
+    test('submitting calls run one at a time', async () => {
+        const {account, contract, tokens, axis} = await setup()
+        tokens.allowance = 10n ** 12n
+        let release
+        const update = contract.update
+        contract.update = async params => {
+            await new Promise(resolve => release = resolve)
+            return update(params)
+        }
+        const canceling = account.cancel(['1'])
+        const selling = account.sell({selling: XLM, buying: USDC, amount: 100n, price: P / 5n})
+        await new Promise(resolve => setTimeout(resolve, 20))
+        //the trade waits for the cancel, so it neither reuses its sequence number nor plans from the old allowance
+        expect(contract.calls.some(c => c[0] === 'sell')).toBe(false)
+        release()
+        await Promise.all([canceling, selling])
+        expect(contract.calls.map(c => c[0])).toEqual(['update', 'sell'])
         axis.close()
     })
 
@@ -546,7 +717,7 @@ describe('AxisAccount', () => {
         axis.tokenBalances = undefined
         axis.ledger = 1000
         account.spent.clear()
-        expect(await account.planApproval(XLM, 10_000_000_000n)).toEqual({amount: 11_000_000_000n, liveUntil: 1000 + 3_110_400})
+        expect(await account.planApproval(XLM, 10_000_000_000n)).toEqual({amount: 11_000_000_000n, liveUntil: 1000 + APPROVAL_TTL_LEDGERS})
         expect(axis.account(TRADER, {approvalTtl: 17_280})).toBe(account)
         expect(await account.planApproval(XLM, 10_000_000_000n)).toEqual({amount: 11_000_000_000n, liveUntil: 1000 + 17_280})
         await expect(account.planApproval(EURC, 1n)).rejects.toThrow('rpcUrl')

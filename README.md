@@ -74,12 +74,23 @@ await account.swap({selling: USDC, buying: EURC, amount: 10_000_000n, direction:
 
 **Allowances.** The contract holds no funds: an order is fillable up to `min(balance, allowance)` in the sold token, and
 one allowance record backs every order selling it. Before each `sell`, `buy`, `swap` and a growing `update`, the account
-checks the allowance and attaches to cover all active orders. A new allowance lives `account.approvalTtl` ledgers
-(`APPROVAL_TTL_LEDGERS`, ~180 days, unless set with `axis.account(address, {approvalTtl})`). A fill lowers the allowance and the order it fills in the
-same pushed ledger, so the memory state stays consistent. The allowance is read over RPC only when the push connection
-is down, the token is not tracked, or for 30 s after this client spent the token as a taker (the push reporting the
-spend may lag behind). An order this client created counts as committed right away (`pending: true`) until the indexer
-reports it.
+checks the allowance and attaches to cover all active orders. An `update` that does not grow its orders still raises an
+allowance that does not back them (the contract would reject it). `cancel`, `cancelAll` and a shrinking `update` lower
+the allowance to what the remaining open orders selling the token need, and to zero when none remain. With more than one
+batch, each batch carries the allowance its orders need, so a declined signature leaves the rest backed.
+`revoke(assets, {cancelOrders?})` sets allowances to zero, optionally canceling the orders selling them in the same
+transactions. A new allowance lives `account.approvalTtl` ledgers (`APPROVAL_TTL_LEDGERS`, ~180 days, unless set with
+`axis.account(address, {approvalTtl})`), at most `MAX_APPROVAL_TTL_LEDGERS`. A fill lowers the allowance and the order
+it fills in the same pushed ledger, so the memory state stays consistent. The allowance is read over RPC only when the
+push connection is down, the token is not tracked, for 30 s after this client spent the token as a taker (the push
+reporting the spend may lag behind), and after this client set it until the push reports the change (at most 6 minutes).
+An order this client created counts as committed right away (`pending: true`) until the indexer reports it, and an order
+it changed or canceled shows the change right away.
+
+**One call at a time.** Calls that submit transactions (`sell`, `buy`, `swap`, `update`, `cancel`, `cancelAll`,
+`revoke`, `crossfill`) run one after another: each one builds its transaction, which fixes its sequence number, and
+plans its approvals only after the previous one settled. Concurrent calls of an account therefore never fail with
+`tx_bad_seq` against each other.
 
 **Balances.** While an account is subscribed, the AXIS API tracks it in every market token.
 `account.balances` / `getBalance(asset)` give the spendable amount, and each change emits
@@ -115,14 +126,15 @@ selling the token oldest first), `backedPct` and `backingPending`.
 | `AxisAccount` | Description |
 |---|---|
 | `orders`, `backing`, `ready`, `loaded` | Open orders by id and backing by token, in memory. |
-| `approvalTtl` | Lifetime of the allowances granted by trading calls, in ledgers (`APPROVAL_TTL_LEDGERS` by default). |
+| `approvalTtl` | Lifetime of the allowances granted by trading calls, in ledgers (`APPROVAL_TTL_LEDGERS` by default, at most `MAX_APPROVAL_TTL_LEDGERS`). |
 | `balances`, `getBalance(asset)`, `funded` | Spendable balances by token (every market token), whether the account exists. |
 | `getOrders({market?, selling?, buying?})` | Open orders, newest first, including `pending` ones this client created. |
 | `getOrder(id)`, `committed(asset)`, `getAllowance(asset)` | Order lookup, open amount selling a token, allowance summary. |
 | `sell(params)`, `buy(params)` | Trade (`{selling, buying, amount, price?, kind?, expires?, orders?, approve?}`); without `price` it is a market order. Without `orders`, a limit order crosses the orders a direct quote finds up to its price (partial crossings included) and rests with the remainder; a market order crosses the quote for the full amount. Returns `{sold, bought, orderId?, order?, approve?}`. |
 | `estimateSell(params)`, `estimateBuy(params)` | Simulate the same trade without signing or submitting it. Returns `{fee, inclusionFee, resourceFee, sold, bought, orderId?}` (fees in stroops, `fee` is the maximum total). |
-| `update(updates)` | Change orders (omitted fields keep their values). |
-| `cancel(ids)`, `cancelAll({market?})` | Remove orders (batches of 100). |
+| `update(updates)` | Change orders (omitted fields keep their values), raising or lowering the allowance to what the open orders need. |
+| `cancel(ids)`, `cancelAll({market?})` | Remove orders (batches of up to 90) and lower the allowance to what the remaining orders need. |
+| `revoke(assets, {cancelOrders?})` | Set the allowances on the tokens to zero, optionally canceling the orders selling them. Returns `{revoked, canceled}`. |
 | `crossfill(takerOrderId, orders?)` | Fill an open order against the book. |
 | `swap({selling, buying, amount, direction?, slippage?})` | Swap along the best AXIS API route. |
 | events | `ready`, `new`, `pending`, `fill`, `filled`, `update`, `cancel`, `expire`, `remove`, `order`, `backing`, `approve`, `trade`, `swap`, `change`, `error` |
@@ -133,7 +145,7 @@ Wraps the on-chain AXIS smart contract for trading and order management.
 
 ```js
 import {Networks, rpc} from '@stellar/stellar-sdk'
-import {AxisContractClient, OrderKind, TradeDirection} from '@axis-markets/client'
+import {AxisContractClient, OrderKind, TradeDirection, APPROVAL_TTL_LEDGERS} from '@axis-markets/client'
 
 const rpcUrl = 'https://soroban-testnet.stellar.org'
 const client = new AxisContractClient({
@@ -156,7 +168,7 @@ const [sold, bought, newOrderId] = await client.sell({
     price: 5n * 10n ** 17n, // at least 0.5 USDC per XLM (18 decimals)
     orders: [], // maker order ids to cross first (from a direct AXIS API quote)
     expires: Math.floor(Date.now() / 1000) + 86_400, // optional expiration of the created order (UNIX seconds)
-    approve: {amount: 100_000_000n, liveUntil: sequence + 518_400} // optional in-call allowance on `selling` (~30 days)
+    approve: {amount: 100_000_000n, liveUntil: sequence + APPROVAL_TTL_LEDGERS} // optional in-call allowance on `selling` (~180 days)
 })
 
 // Fetch an order by id
@@ -223,10 +235,10 @@ of the assets to be quoted by the price oracle:
 - On an existing market the whole `amount` extends the price feeds access of its quoted assets.
 - `selling` and `buying` must differ (`InvalidMatch`, `704`).
 
-The listing fee is derived: the contract computes it as `daily_fee × listing_min_days` from the oracle's daily
-fee, and `loadConfig()` returns both values. `listing_min_days` is 90 at deployment, and the safety admin can set it
-from 0 to 255 days. The fee pays one `track` call split across the listed assets, so at 90 days a pair with one listed
-asset gets 90 days of feed and a pair with both listed 45 days each.
+The listing fee is derived: the contract computes it as `daily_fee × listing_min_days` from the oracle's daily fee, and
+`loadConfig()` returns both values. `listing_min_days` is 90 at deployment, and the safety admin can set it from 0 to
+255 days. The fee pays one `track` call split across the listed assets, so at 90 days a pair with one listed asset gets
+90 days of feed and a pair with both listed 45 days each.
 
 `buy`, `sell` and `update` never call the oracle. They value orders against the prices cached by `requote` and
 `subsidize`, on the selling asset when it is listed and priced and otherwise on the buying asset; no usable price on
@@ -254,17 +266,17 @@ the book are backed by the owner's balance and allowance. Matching never removes
 
 A listed order whose maker's backing left does not cover the fill, whose maker cannot receive the taker's asset (a
 missing or deauthorized trustline), or whose maker's asset cannot be collected is skipped and left unchanged, and a
-`skip` event names it. The order owner is the party at fault. In a `crossfill` the skipped order can be the taker
-order, whose owner cannot back it or be paid: the call then returns `[0n, 0n, 0n]`.
+`skip` event names it. The order owner is the party at fault. In a `crossfill` the skipped order can be the taker order,
+whose owner cannot back it or be paid: the call then returns `[0n, 0n, 0n]`.
 
-A payment to a maker that fails (the taker cannot pay, or the maker cannot be credited although authorized, e.g. a
-full trustline) fails the whole call with the token's own error. The client throws it with `tokenError: true` and
-blames neither side.
+A payment to a maker that fails (the taker cannot pay, or the maker cannot be credited although authorized, e.g. a full
+trustline) fails the whole call with the token's own error. The client throws it with `tokenError: true` and blames
+neither side.
 
-A taker who cannot receive the bought asset fails the call with `CannotReceive` (`708`).
-The contract cannot hold an asset whose issuer requires authorization (`AUTH_REQUIRED`) until the issuer authorizes
-it: buying such an asset fails with `IntermediaryCannotReceive` (`712`). Selling it needs no contract authorization.
-A `swap` is strict: any transfer that fails fails the whole call.
+A taker who cannot receive the bought asset fails the call with `CannotReceive` (`708`). The contract cannot hold an
+asset whose issuer requires authorization (`AUTH_REQUIRED`) until the issuer authorizes it: buying such an asset fails
+with `IntermediaryCannotReceive` (`712`). Selling it needs no contract authorization. A `swap` is strict: any transfer
+that fails fails the whole call.
 
 Pass `approve: {amount, liveUntil}` to `buy`, `sell` or `swap` to grant (or reset) the allowance on the selling asset as
 part of the same transaction (set `asset` to approve another token). `update` takes a separate
@@ -458,7 +470,7 @@ trade or swap id; indexers derive one from the ledger, transaction and event pos
 
 | Event | Topics | Data | Notes |
 |---|---|---|---|
-| `trade` | `trade, selling, buying` (assets sold and bought by the taker) | `order, taker, maker, sold, bought, left` | One per fill. `left` is the order amount after the fill, `0` when the order was filled in full (or what is left became dust) and removed. Fills emit no order event. In a `crossfill` the maker fills name the taker order owner as the taker, and a last event reports the taker order fill with the caller as the taker. |
+| `trade` | `trade, selling, buying` (assets sold and bought by the taker) | `order, taker, maker, sold, bought, left` | One per fill. `left` is the order amount after the fill, `0` when the order was filled in full (or what is left became dust) and removed. Fills emit no order event. `taker` is the account the fill is made for, never the contract: the trader on every `swap` hop, and the caller on every `crossfill` fill, the maker fills (paid by the taker order owner) and a last event reporting the taker order fill with the owner as the maker alike. Summed per account, the `trade` events of a call give each account's net token movement. |
 | `swap` | `swap, selling, buying` | `trader, sold, bought` | One per `swap` call, after the fills of every hop. |
 | `new` | `new, selling, buying` | `id, owner, price, amount, expires` | An order created. `id` is a `u128`, `expires` a `u64` (0 = none). |
 | `mod` | `mod` | `id, price, amount, expires` | An order changed outside a fill: `update` (new price, amount and expiration) or removal by `update`/`cancel` (`amount = 0`). Nothing is emitted when an order expires. |
@@ -477,9 +489,21 @@ Simulation failures caused by the contract are thrown as `Error` with `message` 
 <name>` and a numeric `code` property. A failure raised by a token the call invoked (a settlement transfer) is thrown as
 an `Error` with the token's `code`, `tokenError: true` and the token `contract`, named after `TokenErrors` (for example
 `#10 BalanceError`, which a payer without the balance and a recipient at its trustline limit both raise). Other
-simulation failures are rethrown as the raw RPC error string, not an `Error`. A transaction that passes simulation but
-fails on-chain throws an `Error` with the transaction `hash` property and the transaction result in its `message`.
-`ContractErrors` maps the codes:
+simulation failures are rethrown as the raw RPC error string, not an `Error`.
+
+The client signs with the wallet callback (wallet errors pass through as the SDK throws them), then sends the
+transaction over RPC and waits for its result. A submitted transaction that does not go through throws an `Error` with
+the transaction `hash` and a `status`:
+
+| `status` | Meaning | Other properties |
+|---|---|---|
+| `ERROR` | The network rejected it, nothing was charged. | `result`: the result code, Horizon style, for example `tx_bad_seq` (another transaction of the account went through first) or `tx_insufficient_fee`. A transaction the RPC server accepted but the network dropped because another transaction of the account used its sequence number is reported the same way. |
+| `TRY_AGAIN_LATER` | Not accepted for now: the network is congested, or another transaction of the account is pending. | |
+| `FAILED` | Applied and failed on-chain, the fee was charged. | `result` (`tx_failed`), `opResult` (for example `invoke_host_function_trapped`), and `code` (plus `tokenError` and `contract`) when the RPC server returns the diagnostic events of the transaction: a call that passed simulation can still fail when the book changes before it applies, for example `709` for a `FillOrKill` trade or a `swap`. |
+| `TIMEOUT` | Not seen before its time bounds expired, it can no longer be included. | |
+
+When the RPC server cannot be reached at submission, the client looks the transaction up for a few seconds before
+rethrowing the request error with the transaction `hash`. `ContractErrors` maps the contract codes:
 
 | Code | Name | Meaning |
 |---|---|---|

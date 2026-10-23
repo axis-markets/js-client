@@ -1,13 +1,15 @@
 import {PRICE_SCALE} from './asset-pair.js'
 
 /**
- * Default allowance lifetime granted with a trade, in ledgers: ~180 days at 5s per ledger (the maximum entry TTL)
+ * Longest allowance lifetime the client grants, in ledgers: ~180 days at 5s per ledger, one hour (720 ledgers) short of
+ * the network maximum entry TTL (3,110,400 ledgers).
  */
-export const APPROVAL_TTL_LEDGERS = 3_110_400
+export const MAX_APPROVAL_TTL_LEDGERS = 3_109_680
 
-/**
- * An allowance expiring within this number of ledgers is renewed with the next trade (~1 day)
- */
+/** Default allowance lifetime granted with a trade, in ledgers (~180 days) */
+export const APPROVAL_TTL_LEDGERS = MAX_APPROVAL_TTL_LEDGERS
+
+/** An allowance expiring within this number of ledgers is renewed with the next trade (~1 day) */
 export const APPROVAL_RENEW_LEDGERS = 17_280
 
 /**
@@ -20,8 +22,26 @@ export function planApproval({required, committed, allowance, liveUntil, ledger,
     const target = required + committed
     const expiring = liveUntil > 0 && liveUntil < ledger + APPROVAL_RENEW_LEDGERS
     if (allowance >= target && !expiring)
-        return undefined //TODO: reduce outstanding allowances if the backed amount is reduced (expired or cancelled)
-    return {amount: target, liveUntil: ledger + ttl}
+        return undefined
+    return {amount: target, liveUntil: ledger + Math.min(ttl, MAX_APPROVAL_TTL_LEDGERS)}
+}
+
+/**
+ * Decide whether the allowance can be lowered once the open orders selling the token have been canceled or shrunk.
+ * @param {ReductionPlanParams} params
+ * @return {{amount: bigint, liveUntil: number}|undefined} - Approval to pass with the call, undefined when the allowance does not exceed the target
+ */
+export function planReduction({target, allowance, liveUntil = 0, ledger, ttl = APPROVAL_TTL_LEDGERS}) {
+    if (liveUntil > 0 && liveUntil < ledger)
+        return undefined //an expired allowance reads as zero
+    if (allowance <= target)
+        return undefined
+    if (target <= 0n)
+        return {amount: 0n, liveUntil: 0} //the token checks no lifetime for a zero amount
+    //a nonzero approval must outlive the ledger it applies in: keep a lifetime that does, renew a short one
+    if (liveUntil > ledger + APPROVAL_RENEW_LEDGERS)
+        return {amount: target, liveUntil}
+    return {amount: target, liveUntil: ledger + Math.min(ttl, MAX_APPROVAL_TTL_LEDGERS)}
 }
 
 /**
@@ -43,5 +63,16 @@ export function maxQuoteSpend(amount, price) {
  * @property {bigint} allowance - Current allowance (0 once expired)
  * @property {number} ledger - Current ledger sequence
  * @property {number} [liveUntil] - Ledger the current allowance lives until (0 or omitted when unknown)
- * @property {number} [ttl] - Lifetime of a new allowance in ledgers, {@link APPROVAL_TTL_LEDGERS} by default
+ * @property {number} [ttl] - Lifetime of a new allowance in ledgers, {@link APPROVAL_TTL_LEDGERS} by default, at most
+ * {@link MAX_APPROVAL_TTL_LEDGERS}
+ */
+
+/**
+ * @typedef {{}} ReductionPlanParams
+ * @property {bigint} target - Amount the open orders selling the asset still need after the call
+ * @property {bigint} allowance - Current allowance
+ * @property {number} ledger - Current ledger sequence
+ * @property {number} [liveUntil] - Ledger the current allowance lives until (0 or omitted when unknown)
+ * @property {number} [ttl] - Lifetime of a renewed allowance in ledgers, {@link APPROVAL_TTL_LEDGERS} by default, at
+ * most {@link MAX_APPROVAL_TTL_LEDGERS}
  */

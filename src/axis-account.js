@@ -1,15 +1,21 @@
 import {Emitter} from './emitter.js'
 import {pairKey, invertPrice} from './asset-pair.js'
 import {parseApiDate} from './api-dates.js'
-import {planApproval, maxQuoteSpend, APPROVAL_TTL_LEDGERS} from './allowance.js'
+import {planApproval, planReduction, maxQuoteSpend, APPROVAL_TTL_LEDGERS} from './allowance.js'
 import {OrderKind, TradeDirection} from './constants.js'
 
 /** Orders per `update` transaction  */
 const UPDATE_BATCH = 90
+/** Orders an approval takes the place of in an `update` batch: the token `approve` event is about twice the size of the
+ * `mod` event of a removal, within the 16 KB of events a transaction may emit */
+const APPROVAL_BATCH_WEIGHT = 2
 /** Time to wait for the account state before trading, in milliseconds */
 const READY_TIMEOUT = 15_000
 /** How long an order created by this client counts as committed before the indexer reports it, in milliseconds */
 const LOCAL_ORDER_TTL = 120_000
+/** How long an allowance set by this client overrides pushed records still showing the allowance it replaced, in
+ * milliseconds: the indexer may reload an allowance only with its periodic sweep */
+const APPROVAL_CONFIRM_TIMEOUT = 360_000
 
 /**
  * Trader wrapper that tracks every open order of an account across all markets and the account backing.
@@ -27,7 +33,7 @@ const LOCAL_ORDER_TTL = 120_000
  * - `remove` {@link AccountOrder} - an order left the open orders (after `filled`, `cancel`, `expire`)
  * - `order` `{action, order, fill?}` - any order change
  * - `backing` `{asset, backing}` - the balance, allowance or the backing split of the orders selling a token changed
- * - `approve` `{asset, amount, liveUntil}` - a trading call is about to grant an allowance
+ * - `approve` `{asset, amount, liveUntil}` - a call is about to set an allowance (grant, renew, lower or revoke it)
  * - `trade` {ApiTrade} - the account performed a trade
  * - `swap` {ApiSwap} - the account performed a swap
  * - `change` - the open orders or the backing changed
@@ -106,6 +112,24 @@ export class AxisAccount extends Emitter {
      */
     spent = new Map() //TODO: drop this
     /**
+     * Calls submitting transactions, run one at a time
+     * @type {Promise<void>}
+     * @private
+     */
+    queue = Promise.resolve()
+    /**
+     * Orders removed by this client that the indexer has not reported yet: expiration by order id, UNIX milliseconds
+     * @type {Map<string, number>}
+     * @private
+     */
+    removed = new Map()
+    /**
+     * Allowances set by this client that the pushed state may not reflect yet, by token contract id
+     * @type {Map<string, {amount: bigint, liveUntil: number, replaced?: {allowance: bigint, liveUntil: number}, until: number}>}
+     * @private
+     */
+    approved = new Map()
+    /**
      * @type {function(): void}
      * @private
      */
@@ -179,6 +203,8 @@ export class AxisAccount extends Emitter {
      */
     getOrder(id) {
         const key = id.toString()
+        if (this.isRemoved(key))
+            return undefined
         return this.orders.get(key) ?? this.localOrders().find(order => order.id === key)
     }
 
@@ -259,7 +285,7 @@ export class AxisAccount extends Emitter {
      * @return {Promise<TradeResult>}
      */
     async sell(params) {
-        return this.trade(TradeDirection.Sell, params)
+        return this.serialize(() => this.trade(TradeDirection.Sell, params))
     }
 
     /**
@@ -268,7 +294,7 @@ export class AxisAccount extends Emitter {
      * @return {Promise<TradeResult>}
      */
     async buy(params) {
-        return this.trade(TradeDirection.Buy, params)
+        return this.serialize(() => this.trade(TradeDirection.Buy, params))
     }
 
     /**
@@ -294,82 +320,85 @@ export class AxisAccount extends Emitter {
     }
 
     /**
-     * Change the amount, price or expiration of open orders (omitted fields keep their current values)
+     * Change the amount, price or expiration of open orders (omitted fields keep their current values). The allowance of
+     * every sold token follows what its open orders need: raised when they grow, or when it does not back the changed
+     * orders, lowered when they shrink
      * @param {Array<{id: bigint|string, amount?: bigint, price?: bigint, expires?: number}>} updates
      * @return {Promise<bigint[]>} - Updated order ids
      */
     async update(updates) {
-        await this.whenReady()
-        const normalized = updates.map(update => {
-            const current = this.getOrder(update.id)
-            if (!current && (update.amount === undefined || update.price === undefined))
-                throw new Error(`Order ${update.id} is not an open order of ${this.address}`)
-            return {
-                current,
-                update: {
-                    id: BigInt(update.id),
-                    amount: update.amount ?? current.amount,
-                    price: update.price ?? current.price,
-                    expires: update.expires ?? current?.expires ?? 0
+        return this.serialize(async () => {
+            await this.whenReady()
+            const changes = updates.map(update => {
+                const current = this.getOrder(update.id)
+                if (!current && (update.amount === undefined || update.price === undefined))
+                    throw new Error(`Order ${update.id} is not an open order of ${this.address}`)
+                return {
+                    current,
+                    update: {
+                        id: BigInt(update.id),
+                        amount: update.amount ?? current.amount,
+                        price: update.price ?? current.price,
+                        expires: update.expires ?? current?.expires ?? 0
+                    }
                 }
-            }
+            })
+            return this.submitUpdates(changes, {grow: true})
         })
-        //extra commitment per sold token
-        const growth = new Map()
-        for (const {current, update} of normalized) {
-            if (!current)
-                continue
-            growth.set(current.selling, (growth.get(current.selling) ?? 0n) + update.amount - current.amount)
-        }
-        const approvals = []
-        for (const [asset, delta] of growth) {
-            if (delta <= 0n)
-                continue
-            const approve = await this.planApproval(asset, delta)
-            if (approve) {
-                this.emit('approve', {asset, ...approve})
-                approvals.push({asset, ...approve})
-            }
-        }
-        const client = await this.client()
-        const res = []
-        for (let i = 0; i < normalized.length; i += UPDATE_BATCH) {
-            const batch = normalized.slice(i, i + UPDATE_BATCH).map(n => n.update)
-            //approvals travel with the first batch, before its backing check
-            const ids = await client.update({trader: this.address, updates: batch, approvals: i === 0 ? approvals : []})
-            res.push(...ids)
-        }
-        return res
     }
 
     /**
-     * Cancel open orders
+     * Cancel open orders, lowering the allowance of every sold token to what its remaining open orders need
      * @param {Array<bigint|string>} ids
      * @return {Promise<void>}
      */
     async cancel(ids) {
-        const client = await this.client()
-        const all = ids.map(id => BigInt(id))
-        for (let i = 0; i < all.length; i += UPDATE_BATCH) {
-            await client.cancel(this.address, all.slice(i, i + UPDATE_BATCH))
-        }
-        for (const id of all) {
-            this.local.delete(id.toString())
-        }
+        await this.serialize(() => this.removeOrders(ids))
     }
 
     /**
-     * Cancel all open orders
+     * Cancel all open orders, lowering the allowances like `cancel`
      * @param {{market?: string|{base: string, quote: string}|string[]}} [filter]
      * @return {Promise<string[]>} - Canceled order ids
      */
     async cancelAll({market} = {}) {
-        await this.whenReady()
-        const ids = this.getOrders({market}).map(order => order.id)
-        if (ids.length) {
-            await this.cancel(ids)
-        }
-        return ids
+        return this.serialize(async () => {
+            await this.whenReady()
+            const ids = this.getOrders({market}).map(order => order.id)
+            if (ids.length) {
+                await this.removeOrders(ids)
+            }
+            return ids
+        })
+    }
+
+    /**
+     * Set the allowances granted to the AXIS contract on tokens to zero, optionally canceling the open orders selling them
+     * in the same transactions. The revocation goes with the first transaction. Works while the contract is frozen
+     * @param {string[]} assets - Token contract ids
+     * @param {{cancelOrders?: boolean}} [options] - Also cancel every open order selling these tokens
+     * @return {Promise<AccountRevokeResult>}
+     * @throws {Error} - The submission error, with the `revoked` tokens and the `canceled` order ids done before it
+     */
+    async revoke(assets, {cancelOrders = false} = {}) {
+        return this.serialize(async () => {
+            const tokens = [...new Set(assets)]
+            let ids = []
+            if (cancelOrders) {
+                await this.whenReady()
+                ids = [...this.allOrders()].filter(order => tokens.includes(order.selling)).map(order => order.id)
+            }
+            try {
+                const canceled = await this.removeOrders(ids, tokens)
+                return {revoked: tokens, canceled: canceled.map(id => id.toString())}
+            } catch (e) {
+                if (e instanceof Error) {
+                    e.revoked = e.progress?.batches > 0 ? tokens : []
+                    e.canceled = (e.progress?.updated ?? []).map(id => id.toString())
+                }
+                throw e
+            }
+        })
     }
 
     /**
@@ -379,15 +408,17 @@ export class AxisAccount extends Emitter {
      * @return {Promise<{sold: bigint, bought: bigint, surplus: bigint}>}
      */
     async crossfill(takerOrderId, orders) {
-        if (!orders) {
-            const taker = this.getOrder(takerOrderId) ?? await this.axis.getOrder(takerOrderId)
-            if (!taker)
-                throw new Error(`Order ${takerOrderId} not found`)
-            orders = (await this.findQuote(TradeDirection.Sell, taker.selling, taker.buying, taker.amount)).orders
-        }
-        const client = await this.client()
-        const [sold, bought, surplus] = await client.crossfill(this.address, BigInt(takerOrderId), orders.map(id => BigInt(id)))
-        return {sold, bought, surplus}
+        return this.serialize(async () => {
+            if (!orders) {
+                const taker = this.getOrder(takerOrderId) ?? await this.axis.getOrder(takerOrderId)
+                if (!taker)
+                    throw new Error(`Order ${takerOrderId} not found`)
+                orders = (await this.findQuote(TradeDirection.Sell, taker.selling, taker.buying, taker.amount)).orders
+            }
+            const client = await this.client()
+            const [sold, bought, surplus] = await client.crossfill(this.address, BigInt(takerOrderId), orders.map(id => BigInt(id)))
+            return {sold, bought, surplus}
+        })
     }
 
     /**
@@ -395,7 +426,16 @@ export class AxisAccount extends Emitter {
      * @param {SwapParams} params
      * @return {Promise<{sold: bigint, bought: bigint, approve?: import('./index.js').Approval}>}
      */
-    async swap({selling, buying, amount, direction = TradeDirection.Sell, slippage = 0}) {
+    async swap(params) {
+        return this.serialize(() => this.trySwap(params))
+    }
+
+    /**
+     * @param {SwapParams} params
+     * @return {Promise<{sold: bigint, bought: bigint, approve?: import('./index.js').Approval}>}
+     * @private
+     */
+    async trySwap({selling, buying, amount, direction = TradeDirection.Sell, slippage = 0}) {
         await this.whenReady()
         const params = {sellingAsset: selling, buyingAsset: buying, amount: amount.toString()}
         const quote = direction === TradeDirection.Buy ?
@@ -440,25 +480,33 @@ export class AxisAccount extends Emitter {
      */
     async planApproval(asset, required) {
         await this.whenReady()
-        const backing = this.backing.get(asset)
-        let allowance
-        if (this.isAllowanceCurrent(asset) || (backing?.updated && !this.axis.tokenBalances)) {
-            allowance = backing.allowance
-        } else {
-            const {tokenBalances} = this.axis
-            if (!tokenBalances)
-                throw new Error(`The allowance of ${this.address} in ${asset} is not tracked: set the \`rpcUrl\` option to read it`)
-            await this.axis.getContractId() //the allowance spender
-            allowance = await tokenBalances.getAllowance(asset, this.address).catch(() => 0n) //unknown: a redundant approval, never a shortfall
-        }
+        const allowance = await this.readAllowance(asset) ?? 0n //unknown: a redundant approval, never a shortfall
         return planApproval({
             required,
             committed: this.committed(asset),
             allowance,
-            liveUntil: backing?.liveUntil ?? 0,
+            liveUntil: this.backing.get(asset)?.liveUntil ?? 0,
             ledger: await this.axis.getLedger(),
             ttl: this.approvalTtl
         })
+    }
+
+    /**
+     * Current allowance of a token: the pushed value while it can be trusted, otherwise read over RPC
+     * @param {string} asset - Token contract id
+     * @return {Promise<bigint|undefined>} - Undefined when the RPC read fails
+     * @throws {Error} - If the token is not tracked and there is no RPC to read it from
+     * @private
+     */
+    async readAllowance(asset) {
+        const backing = this.backing.get(asset)
+        if (this.isAllowanceCurrent(asset) || (backing?.updated && !this.axis.tokenBalances))
+            return backing.allowance
+        const {tokenBalances} = this.axis
+        if (!tokenBalances)
+            throw new Error(`The allowance of ${this.address} in ${asset} is not tracked: set the \`rpcUrl\` option to read it`)
+        await this.axis.getContractId() //the allowance spender
+        return tokenBalances.getAllowance(asset, this.address).catch(() => undefined)
     }
 
     /**
@@ -471,6 +519,8 @@ export class AxisAccount extends Emitter {
         const backing = this.backing.get(asset)
         if (!this.live || !this.axis.stream.connected || !backing?.updated || backing.pending)
             return false
+        if (this.pendingApproval(asset))
+            return false //set by this client, not confirmed by the push yet
         const spent = this.spent.get(asset)
         if (spent === undefined)
             return true
@@ -640,6 +690,198 @@ export class AxisAccount extends Emitter {
     }
 
     /**
+     * Run calls submitting transactions one at a time: each one reads the sequence number and plans its approvals only
+     * after the previous one settled, so concurrent calls neither collide on the sequence number nor overwrite each
+     * other's approvals
+     * @template T
+     * @param {function(): Promise<T>} call
+     * @return {Promise<T>}
+     * @private
+     */
+    serialize(call) {
+        const result = this.queue.then(call)
+        this.queue = result.then(() => undefined, () => undefined)
+        return result
+    }
+
+    /**
+     * Remove orders, lowering the allowances to what the remaining orders need
+     * @param {Array<bigint|string>} ids
+     * @param {string[]} [revoke] - Tokens to revoke the allowance on with the first transaction
+     * @return {Promise<bigint[]>} - Removed order ids
+     * @private
+     */
+    removeOrders(ids, revoke) {
+        const changes = ids.map(id => ({current: this.getOrder(id), update: {id: BigInt(id), amount: 0n, price: 0n, expires: 0}}))
+        return this.submitUpdates(changes, {revoke})
+    }
+
+    /**
+     * Send order changes in `update` batches. Each batch carries the approvals that keep the allowance of every token it
+     * changes at what the open orders selling it need once the batch applies: raised when they grow (`grow` only), or
+     * when the allowance does not back the changed orders, lowered when they shrink. The `revoke` tokens are set to zero
+     * with the first batch
+     * @param {Array<{current?: AccountOrder, update: OrderUpdate}>} changes - New values per order, with the order in
+     * memory when known
+     * @param {{grow?: boolean, revoke?: string[]}} [options] - `grow`: allowances may be raised (updates, never cancels)
+     * @return {Promise<bigint[]>} - Updated or removed order ids
+     * @throws {Error} - The submission error, with `progress` `{updated, batches}` done before it
+     * @private
+     */
+    async submitUpdates(changes, {grow = false, revoke = []} = {}) {
+        const batches = splitBatches(changes, revoke)
+        if (!batches.length)
+            return []
+        const plan = await this.snapshotAllowances(changes, revoke, grow)
+        const client = await this.client()
+        const ids = []
+        for (let i = 0; i < batches.length; i++) {
+            const batch = batches[i]
+            const approvals = i === 0 ? revoke.map(asset => ({asset, amount: 0n, liveUntil: 0})) : []
+            if (plan) {
+                approvals.push(...planBatch(plan, batch, grow))
+            }
+            for (const approval of approvals) {
+                this.emit('approve', approval)
+            }
+            try {
+                ids.push(...await client.update({trader: this.address, updates: batch.map(change => change.update), approvals}))
+            } catch (e) {
+                if (e instanceof Error) {
+                    e.progress = {updated: ids, batches: i}
+                }
+                throw e
+            }
+            this.applyBatch(batch, approvals)
+        }
+        return ids
+    }
+
+    /**
+     * Committed amounts and allowances of the tokens the changed orders sell, read once before the first batch: every
+     * batch target derives from them, as pushes arriving between batches already drop the removed orders
+     * @param {Array<{current?: AccountOrder}>} changes
+     * @param {string[]} revoke - Tokens revoked anyway
+     * @param {boolean} grow - Whether allowances may be raised: a failed read throws then, otherwise nothing is planned
+     * @return {Promise<AllowancePlan|null>} - Null when no allowance is planned
+     * @private
+     */
+    async snapshotAllowances(changes, revoke, grow) {
+        const assets = new Set()
+        for (const {current} of changes) {
+            if (current && !revoke.includes(current.selling)) {
+                assets.add(current.selling)
+            }
+        }
+        if (!assets.size || !this.loaded)
+            return null
+        try {
+            const ledger = await this.axis.getLedger()
+            const tokens = new Map()
+            for (const asset of assets) {
+                const liveUntil = this.backing.get(asset)?.liveUntil ?? 0
+                let allowance = await this.readAllowance(asset)
+                if (allowance !== undefined && liveUntil > 0 && liveUntil < ledger) {
+                    allowance = 0n //an expired allowance reads as zero
+                }
+                tokens.set(asset, {committed: this.committed(asset), allowance, liveUntil, change: 0n})
+            }
+            return {ledger, ttl: this.approvalTtl, tokens}
+        } catch (e) {
+            if (grow)
+                throw e
+            return null //a cancel goes through without lowering the allowances
+        }
+    }
+
+    /**
+     * Reflect a confirmed `update` batch before the indexer reports it: removed orders leave the open orders, changed
+     * ones take their new values, approved allowances replace the pushed ones
+     * @param {Array<{current?: AccountOrder, update: OrderUpdate}>} batch
+     * @param {import('./index.js').Approval[]} approvals
+     * @private
+     */
+    applyBatch(batch, approvals) {
+        const until = Date.now() + LOCAL_ORDER_TTL
+        for (const {current, update} of batch) {
+            const key = update.id.toString()
+            if (update.amount === 0n) {
+                this.local.delete(key)
+                if (this.orders.has(key)) {
+                    this.removed.set(key, until)
+                }
+            } else if (current) {
+                Object.assign(current, {amount: update.amount, price: update.price, expires: Number(update.expires)})
+            }
+        }
+        for (const {asset, amount, liveUntil} of approvals) {
+            const backing = this.backing.get(asset)
+            this.approved.set(asset, {
+                amount,
+                liveUntil,
+                replaced: backing && {allowance: backing.allowance, liveUntil: backing.liveUntil},
+                until: Date.now() + APPROVAL_CONFIRM_TIMEOUT
+            })
+            if (backing) {
+                const updated = withAllowance(backing, amount, liveUntil)
+                this.backing.set(asset, updated)
+                this.emit('backing', {asset, backing: updated})
+            }
+        }
+        this.emit('change')
+    }
+
+    /**
+     * Keep an allowance this client set over an incoming record that still shows the allowance it replaced
+     * @param {string} asset
+     * @param {AccountBacking} backing - Incoming record
+     * @return {AccountBacking}
+     * @private
+     */
+    reconcileBacking(asset, backing) {
+        const expected = this.pendingApproval(asset)
+        if (!expected)
+            return backing
+        const {replaced} = expected
+        if (replaced && backing.allowance === replaced.allowance && backing.liveUntil === replaced.liveUntil)
+            return withAllowance(backing, expected.amount, expected.liveUntil)
+        this.approved.delete(asset) //the record shows the approval, or a later change
+        return backing
+    }
+
+    /**
+     * Allowance set by this client that the pushed state did not confirm yet
+     * @param {string} asset
+     * @return {{amount: bigint, liveUntil: number, replaced?: {allowance: bigint, liveUntil: number}}|undefined}
+     * @private
+     */
+    pendingApproval(asset) {
+        const expected = this.approved.get(asset)
+        if (expected && expected.until < Date.now()) {
+            this.approved.delete(asset)
+            return undefined
+        }
+        return expected
+    }
+
+    /**
+     * Whether an order was removed by this client and the indexer has not reported it yet
+     * @param {string} id
+     * @return {boolean}
+     * @private
+     */
+    isRemoved(id) {
+        const until = this.removed.get(id)
+        if (until === undefined)
+            return false
+        if (until < Date.now()) {
+            this.removed.delete(id)
+            return false
+        }
+        return true
+    }
+
+    /**
      * @return {Promise<AxisContractClient>}
      * @private
      */
@@ -707,9 +949,14 @@ export class AxisAccount extends Emitter {
             this.local.delete(order.id)
         }
         this.orders = next
+        for (const id of this.removed.keys()) {
+            if (!next.has(id)) {
+                this.removed.delete(id)
+            }
+        }
         const backing = mergeBacking ? new Map(this.backing) : new Map()
         for (const [asset, raw] of Object.entries(state.backing || {})) {
-            backing.set(asset, parseBacking(asset, raw))
+            backing.set(asset, this.reconcileBacking(asset, parseBacking(asset, raw)))
         }
         this.backing = backing
         if (this.loaded) {
@@ -743,6 +990,7 @@ export class AxisAccount extends Emitter {
         const removed = action === 'filled' || action === 'cancel' || action === 'expire'
         if (removed) {
             this.orders.delete(order.id)
+            this.removed.delete(order.id)
         } else {
             if (previous && order.backed === null) {
                 //the event serialization may lack the split; keep the last known one until the backing update
@@ -774,7 +1022,7 @@ export class AxisAccount extends Emitter {
      * @private
      */
     applyBacking({asset, backing: raw, backed}) {
-        const backing = raw ? parseBacking(asset, raw) : undefined
+        const backing = raw ? this.reconcileBacking(asset, parseBacking(asset, raw)) : undefined
         if (backing) {
             this.backing.set(asset, backing)
         } else {
@@ -797,7 +1045,11 @@ export class AxisAccount extends Emitter {
      * @private
      */
     * allOrders() {
-        yield* this.orders.values()
+        for (const order of this.orders.values()) {
+            if (!this.isRemoved(order.id)) {
+                yield order
+            }
+        }
         yield* this.localOrders()
     }
 
@@ -902,6 +1154,91 @@ function share(part, total) {
     if (total <= 0n)
         return 1
     return Math.max(0, Math.min(1, Number(part * 10_000n / total) / 10_000))
+}
+
+/**
+ * Split order changes into `update` batches, leaving event room for the approvals a batch may carry
+ * @param {Array<{current?: AccountOrder, update: OrderUpdate}>} changes
+ * @param {string[]} revoke - Tokens revoked with the first batch
+ * @return {Array<Array<{current?: AccountOrder, update: OrderUpdate}>>}
+ */
+function splitBatches(changes, revoke) {
+    const batches = []
+    let batch
+    let tokens
+    for (const change of changes) {
+        const asset = change.current?.selling
+        if (batch) {
+            const approvals = tokens.size + (asset && !tokens.has(asset) ? 1 : 0)
+            if (batch.length + 1 + APPROVAL_BATCH_WEIGHT * approvals > UPDATE_BATCH) {
+                batch = undefined
+            }
+        }
+        if (!batch) {
+            batch = []
+            tokens = new Set(batches.length ? [] : revoke)
+            batches.push(batch)
+        }
+        batch.push(change)
+        if (asset) {
+            tokens.add(asset)
+        }
+    }
+    if (!batches.length && revoke.length) {
+        batches.push([]) //a revocation alone
+    }
+    return batches
+}
+
+/**
+ * Approvals of one `update` batch, advancing the planned allowances: an allowance grows only when the batch
+ * grows the orders selling the token, or when it does not back the changed orders (the contract checks that), and
+ * lowered when the batch shrinks them
+ * @param {AllowancePlan} plan
+ * @param {Array<{current?: AccountOrder, update: OrderUpdate}>} batch
+ * @param {boolean} grow - Whether allowances may be raised
+ * @return {import('./index.js').Approval[]}
+ */
+function planBatch({ledger, ttl, tokens}, batch, grow) {
+    //change of the committed amount and the new amounts of the changed orders, per sold token
+    const changed = new Map()
+    for (const {current, update} of batch) {
+        if (!current || !tokens.has(current.selling))
+            continue
+        const entry = changed.get(current.selling) ?? {delta: 0n, need: 0n}
+        entry.delta += update.amount - current.amount
+        entry.need += update.amount
+        changed.set(current.selling, entry)
+    }
+    const approvals = []
+    for (const [asset, {delta, need}] of changed) {
+        const token = tokens.get(asset)
+        token.change += delta
+        let approval
+        if (grow && (delta > 0n || (token.allowance ?? 0n) < need)) {
+            //unknown: a redundant approval, never a shortfall
+            approval = planApproval({required: token.change, committed: token.committed, allowance: token.allowance ?? 0n, liveUntil: token.liveUntil, ledger, ttl})
+        } else if (delta < 0n && token.allowance !== undefined) {
+            approval = planReduction({target: token.committed + token.change, allowance: token.allowance, liveUntil: token.liveUntil, ledger, ttl})
+        }
+        if (approval) {
+            approvals.push({asset, ...approval})
+            token.allowance = approval.amount
+            token.liveUntil = approval.liveUntil
+        }
+    }
+    return approvals
+}
+
+/**
+ * @param {AccountBacking} backing
+ * @param {bigint} allowance
+ * @param {number} liveUntil
+ * @return {AccountBacking} - The record with another allowance
+ */
+function withAllowance(backing, allowance, liveUntil) {
+    const budget = !backing.authorized ? 0n : backing.balance < allowance ? backing.balance : allowance
+    return {...backing, allowance, liveUntil, budget}
 }
 
 /**
@@ -1010,6 +1347,23 @@ function newestFirst(x, y) {
  * @property {string} [orderId] - ID of the order created for a limit remainder
  * @property {AccountOrder} [order] - The created order (unconfirmed until the indexer reports it)
  * @property {Approval} [approve] - Approval granted with the trade
+ */
+
+/**
+ * @typedef {{}} AccountRevokeResult
+ * @property {string[]} revoked - Tokens whose allowance was set to zero
+ * @property {string[]} canceled - Canceled order ids
+ */
+
+/**
+ * @typedef {{}} AllowancePlan - Allowances planned across the `update` batches of a call
+ * @property {number} ledger - Current ledger sequence
+ * @property {number} ttl - Lifetime of a new allowance, in ledgers
+ * @property {Map<string, {committed: bigint, allowance?: bigint, liveUntil: number, change: bigint}>} tokens - Open amount before the call, the current allowance (undefined when unknown) and the committed change of the batches planned so far for each sold token
+ */
+
+/**
+ * @typedef {import('./index.js').OrderUpdate} OrderUpdate
  */
 
 /**

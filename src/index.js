@@ -1,6 +1,6 @@
-import {Contract, Networks, Operation, SorobanDataBuilder, TransactionBuilder, contract, rpc, xdr} from '@stellar/stellar-sdk'
+import {Contract, Keypair, Networks, Operation, SorobanDataBuilder, TransactionBuilder, contract, rpc, xdr} from '@stellar/stellar-sdk'
 import ContractClient from './contract-client.js'
-import {ContractErrors, TokenErrors, processSimulationErrors, processTransactionErrors} from './errors.js'
+import {ContractErrors, TokenErrors, processSimulationErrors, transactionError} from './errors.js'
 import {AxisApiClient, AxisApiError} from './api-client.js'
 import {collectOrderIds, completeFootprint, ensureOrdersFootprint} from './footprint.js'
 import {orderId, generateNonce} from './order-id.js'
@@ -13,7 +13,7 @@ export {AxisAccount, parseApiOrder} from './axis-account.js'
 export {AxisStreamClient} from './stream-client.js'
 export {TokenBalance} from './token-balance.js'
 export {Emitter} from './emitter.js'
-export {planApproval, maxQuoteSpend, APPROVAL_TTL_LEDGERS, APPROVAL_RENEW_LEDGERS} from './allowance.js'
+export {planApproval, planReduction, maxQuoteSpend, APPROVAL_TTL_LEDGERS, MAX_APPROVAL_TTL_LEDGERS, APPROVAL_RENEW_LEDGERS} from './allowance.js'
 export {canonicalPair, compareAssets, pairKey, invertPrice, invertTicker, PRICE_SCALE} from './asset-pair.js'
 export {parseApiDate} from './api-dates.js'
 
@@ -24,6 +24,21 @@ const DEFAULT_LEDGER_TIME = 5
 const KEEPALIVE_DAYS = 30
 //validity window of transactions built by the client, in seconds
 const TX_TIMEOUT = 60
+//delay between transaction status checks: grows by 1 s per check, up to 3 s
+const POLL_STEP = 1_000
+const POLL_MAX_DELAY = 3_000
+//how long to look for a transaction whose submission request failed, in milliseconds
+const SEND_FAILURE_WINDOW = 30_000
+//failed status requests in a row after which a transaction whose submission request failed is reported as not sent
+const SEND_FAILURE_REQUESTS = 3
+//margin for the local clock when the RPC server reports no ledger close time, in seconds
+const CLOCK_MARGIN = 15
+//how long to wait for a transaction without time bounds, in milliseconds
+const UNBOUNDED_WAIT = 300_000
+//status checks after which a transaction not found yet is checked against the sequence number of its source account
+const SEQUENCE_CHECK_AFTER = 3
+//a pending transaction another transaction of the account replaced: dropped by the network
+const SUPERSEDED = Symbol('superseded')
 
 /**
  * Smart contract client for trading with AXIS DEX
@@ -406,23 +421,160 @@ function isArchived(entry, latestLedger) {
 /**
  * Submit a signed transaction and wait for its result
  * @param {rpc.Server} server
- * @param {import('@stellar/stellar-sdk').Transaction} tx
- * @return {Promise<void>}
- * @throws {Error} - If the transaction is rejected, fails or is not included in time
+ * @param {import('@stellar/stellar-sdk').Transaction} tx - Signed transaction
+ * @param {string} [contractId] - DEX contract address, to tell its errors from the errors of the tokens it calls
+ * @return {Promise<rpc.Api.GetSuccessfulTransactionResponse>}
+ * @throws {Error} - A {@link transactionError} when the network does not accept the transaction (`ERROR`,
+ * `TRY_AGAIN_LATER`), it fails on-chain (`FAILED`) or it is not seen before its time bounds expire (`TIMEOUT`); the
+ * request error, with the transaction `hash`, when the RPC server cannot be reached
  * @internal
  */
-async function submitTransaction(server, tx) {
-    const sent = await server.sendTransaction(tx)
-    if (sent.status !== 'PENDING' && sent.status !== 'DUPLICATE')
-        throw new Error(`Transaction ${sent.hash} rejected: ${sent.errorResult?.result?.type ?? sent.status}`)
-    const res = await server.pollTransaction(sent.hash, {attempts: TX_TIMEOUT})
-    if (res.status === 'FAILED') {
-        const error = new Error(`Transaction ${sent.hash} failed: ${res.resultXdr?.result?.type ?? 'unknown result'}`)
-        error.hash = sent.hash
-        throw error
+async function submitTransaction(server, tx, contractId) {
+    const hash = toHex(tx.hash())
+    let sent
+    try {
+        sent = await server.sendTransaction(tx)
+    } catch (e) {
+        //the request may have reached the network before it failed: look for the transaction before reporting it
+        const response = await waitForTransaction(server, tx, hash, {window: SEND_FAILURE_WINDOW, maxFailures: SEND_FAILURE_REQUESTS})
+        if (!response) {
+            if (e instanceof Error) {
+                e.hash = hash
+            }
+            throw e
+        }
+        return checkTransaction(response, hash, contractId)
     }
-    if (res.status !== 'SUCCESS')
-        throw new Error(`Transaction ${sent.hash} was not included in time`)
+    if (sent.status === 'ERROR')
+        throw transactionError('ERROR', {hash, result: sent.errorResult, events: sent.diagnosticEvents, contractId})
+    if (sent.status === 'TRY_AGAIN_LATER')
+        throw transactionError('TRY_AGAIN_LATER', {hash})
+    //PENDING, or DUPLICATE when the network already has it
+    const response = await waitForTransaction(server, tx, hash)
+    if (!response)
+        throw transactionError('TIMEOUT', {hash})
+    return checkTransaction(response, hash, contractId)
+}
+
+/**
+ * Poll the status of a submitted transaction until it is found, or can no longer be included: its time bounds expired,
+ * or another transaction of its source account consumed its sequence number (an RPC server behind a load balancer can
+ * accept two transactions with the same sequence number, the network then drops one of them)
+ * @param {rpc.Server} server
+ * @param {import('@stellar/stellar-sdk').Transaction} tx - Submitted transaction
+ * @param {string} hash - Transaction hash, hex
+ * @param {{window?: number, maxFailures?: number}} [options] - Longest wait in milliseconds, and the number of failed
+ * requests in a row to give up after
+ * @return {Promise<rpc.Api.GetSuccessfulTransactionResponse|rpc.Api.GetFailedTransactionResponse|SUPERSEDED|undefined>} -
+ * Undefined if not found
+ * @internal
+ */
+async function waitForTransaction(server, tx, hash, {window, maxFailures} = {}) {
+    const started = Date.now()
+    const maxTime = Number(tx.timeBounds?.maxTime) || 0
+    let failures = 0
+    let consumedAt
+    for (let attempt = 1; ; attempt++) {
+        let response
+        try {
+            response = await server.getTransaction(hash)
+            failures = 0
+        } catch (e) {
+            failures++ //a failed request tells nothing about the transaction
+        }
+        if (response && response.status !== 'NOT_FOUND')
+            return response
+        //the server had seen the ledger where the sequence number was consumed and still does not know the transaction
+        if (consumedAt !== undefined && response?.latestLedger >= consumedAt)
+            return SUPERSEDED
+        if (consumedAt === undefined && response && attempt >= SEQUENCE_CHECK_AFTER) {
+            consumedAt = await sequenceConsumedAt(server, tx)
+        }
+        if (maxFailures && failures >= maxFailures)
+            return undefined
+        if (window && Date.now() - started >= window)
+            return undefined
+        if (isPastTimeBounds(response, maxTime, started))
+            return undefined
+        await new Promise(resolve => setTimeout(resolve, Math.min(attempt * POLL_STEP, POLL_MAX_DELAY)))
+    }
+}
+
+/**
+ * Check whether the source account of a transaction moved past its sequence number
+ * @param {rpc.Server} server
+ * @param {import('@stellar/stellar-sdk').Transaction} tx
+ * @return {Promise<number|undefined>} - Latest ledger of the RPC server when it reported the account past the
+ * transaction sequence number, undefined otherwise
+ * @internal
+ */
+async function sequenceConsumedAt(server, tx) {
+    try {
+        const key = xdr.LedgerKey.account(new xdr.LedgerKeyAccount({accountId: Keypair.fromPublicKey(tx.source).xdrPublicKey()}))
+        const {entries, latestLedger} = await server.getLedgerEntries(key)
+        const seqNum = entries[0]?.val?.value?.seqNum
+        return seqNum !== undefined && BigInt(seqNum) >= BigInt(tx.sequence) ? latestLedger : undefined
+    } catch (e) {
+        return undefined //a muxed source, or the request failed
+    }
+}
+
+/**
+ * Whether a transaction not found yet can no longer be included: a ledger closing after its upper time bound cannot
+ * include it, and the RPC server has seen every ledger up to the latest one it reports
+ * @param {rpc.Api.GetTransactionResponse|undefined} response - Latest status response, if any
+ * @param {number} maxTime - Upper time bound, UNIX seconds (0 = none)
+ * @param {number} started - When polling started, UNIX milliseconds
+ * @return {boolean}
+ * @internal
+ */
+function isPastTimeBounds(response, maxTime, started) {
+    if (!maxTime)
+        return Date.now() - started >= UNBOUNDED_WAIT
+    const closeTime = Number(response?.latestLedgerCloseTime)
+    if (closeTime)
+        return closeTime > maxTime
+    return Date.now() / 1000 > maxTime + CLOCK_MARGIN
+}
+
+/**
+ * @param {rpc.Api.GetSuccessfulTransactionResponse|rpc.Api.GetFailedTransactionResponse|SUPERSEDED} response
+ * @param {string} hash
+ * @param {string} [contractId]
+ * @return {rpc.Api.GetSuccessfulTransactionResponse}
+ * @throws {Error} - A `FAILED` {@link transactionError}, or an `ERROR` one with `tx_bad_seq` for a transaction dropped
+ * because another one consumed its sequence number
+ * @internal
+ */
+function checkTransaction(response, hash, contractId) {
+    if (response === SUPERSEDED)
+        throw transactionError('ERROR', {hash, resultCode: 'tx_bad_seq'})
+    if (response.status === 'FAILED')
+        throw transactionError('FAILED', {hash, result: response.resultXdr, events: diagnosticEvents(response), contractId})
+    return response
+}
+
+/**
+ * Diagnostic events of an applied transaction: reported separately by RPC servers that keep them, otherwise taken from
+ * the transaction meta (empty when the network did not record them)
+ * @param {rpc.Api.GetFailedTransactionResponse} response
+ * @return {xdr.DiagnosticEvent[]}
+ * @internal
+ */
+function diagnosticEvents(response) {
+    if (response.diagnosticEventsXdr?.length)
+        return response.diagnosticEventsXdr
+    const meta = response.resultMetaXdr?.value
+    return meta?.diagnosticEvents ?? meta?.sorobanMeta?.diagnosticEvents ?? []
+}
+
+/**
+ * @param {Uint8Array} bytes
+ * @return {string}
+ * @internal
+ */
+function toHex(bytes) {
+    return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
 /**
@@ -439,16 +591,18 @@ function toApproval(approve, defaultAsset) {
 }
 
 /**
- * Sign and submit a simulated transaction
+ * Sign and submit a simulated transaction. Submitted over RPC directly rather than with `tx.signAndSend()`, whose send
+ * failure carries the RPC response only as text
  * @param {contract.AssembledTransaction} tx
  * @return {Promise<*>} - Parsed contract call result
- * @throws {Error} - If the transaction failed on-chain
+ * @throws {Error} - The wallet error when signing fails, a {@link transactionError} when the transaction is not
+ * accepted, fails on-chain or is not confirmed in time
  * @internal
  */
 async function signAndSend(tx) {
-    const sent = await tx.signAndSend()
-    processTransactionErrors(sent)
-    return sent.result
+    await tx.sign()
+    const response = await submitTransaction(tx.server, tx.signed, tx.options.contractId)
+    return response.returnValue === undefined ? undefined : tx.options.parseResultXdr(response.returnValue)
 }
 
 async function execTrade(params, direction, context) {

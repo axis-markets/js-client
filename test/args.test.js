@@ -1,4 +1,4 @@
-import {Account, Contract, Keypair, Networks, SorobanDataBuilder, TransactionBuilder, xdr, nativeToScVal, scValToNative} from '@stellar/stellar-sdk'
+import {Account, Contract, Keypair, Networks, Operation, SorobanDataBuilder, TransactionBuilder, xdr, nativeToScVal, scValToNative} from '@stellar/stellar-sdk'
 import ContractClient from '../src/contract-client.js'
 import {AxisContractClient, OrderKind, TradeDirection, orderId} from '../src/index.js'
 
@@ -130,17 +130,37 @@ describe('contract argument encoding', () => {
     })
 })
 
+/** Signed transaction double with a hash and time bounds */
+function signedTx() {
+    return new TransactionBuilder(new Account(TRADER, '1'), {fee: '100', networkPassphrase: Networks.TESTNET})
+        .addOperation(Operation.bumpSequence({bumpTo: '2'}))
+        .setTimeout(300)
+        .build()
+}
+
+/** Simulated transaction double whose submission succeeds with `result` */
+function assembled(result) {
+    return {
+        simulation: {},
+        built: null,
+        options: {contractId: CONTRACT, parseResultXdr: value => value},
+        server: {
+            sendTransaction: async () => ({status: 'PENDING'}),
+            getTransaction: async () => ({status: 'SUCCESS', returnValue: result})
+        },
+        async sign() {
+            this.signed = signedTx()
+        }
+    }
+}
+
 describe('AxisContractClient argument mapping', () => {
     /** Replace the inner contract client with a recorder returning a canned result */
     function stub(axis, method, result) {
         const calls = []
         axis.client[method] = async (args, options) => {
             calls.push({args, options})
-            return {
-                simulation: {},
-                built: null,
-                signAndSend: async () => ({result})
-            }
+            return assembled(result)
         }
         const footprints = []
         const settlements = []
@@ -339,7 +359,7 @@ describe('AxisContractClient argument mapping', () => {
             simulation: {},
             isReadCall: true,
             result: market,
-            signAndSend: async () => {
+            sign: async () => {
                 throw new Error('This is a read call. It requires no signature or sending.')
             }
         })
@@ -400,7 +420,8 @@ describe('AxisContractClient.keepalive', () => {
                 calls.sent.push(tx)
                 return {status: sendStatus, hash: 'ab'.repeat(32)}
             },
-            pollTransaction: async () => ({status: resultStatus})
+            //a transaction not found once a ledger closed past its time bounds can no longer be included
+            getTransaction: async () => ({status: resultStatus, latestLedgerCloseTime: String(Math.floor(Date.now() / 1000) + 3600)})
         }
         return {axis, signed, calls}
     }
@@ -455,9 +476,9 @@ describe('AxisContractClient.keepalive', () => {
         await expect(setup({simulation: restore}).axis.keepalive()).rejects.toThrow('archived during the keepalive')
         await expect(setup({executable: null}).axis.keepalive()).rejects.toThrow('instance not found')
         await expect(setup({executable: {type: 'contractExecutableStellarAsset'}}).axis.keepalive()).rejects.toThrow('no Wasm code')
-        await expect(setup({resultStatus: 'FAILED'}).axis.keepalive()).rejects.toThrow('failed')
-        await expect(setup({sendStatus: 'ERROR'}).axis.keepalive()).rejects.toThrow('rejected')
-        await expect(setup({resultStatus: 'NOT_FOUND'}).axis.keepalive()).rejects.toThrow('not included in time')
+        await expect(setup({resultStatus: 'FAILED'}).axis.keepalive()).rejects.toThrow(expect.objectContaining({status: 'FAILED'}))
+        await expect(setup({sendStatus: 'ERROR'}).axis.keepalive()).rejects.toThrow('not accepted by the network')
+        await expect(setup({resultStatus: 'NOT_FOUND'}).axis.keepalive()).rejects.toThrow(expect.objectContaining({status: 'TIMEOUT'}))
     })
 
     /** Footprint operations signed in order, with the keys each one declares */

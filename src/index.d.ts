@@ -363,7 +363,11 @@ export interface SubsidizeArguments {
     amount: bigint;
 }
 
-/** Smart contract client for trading with AXIS DEX */
+/**
+ * Smart contract client for trading with AXIS DEX. Calls submitting a transaction sign it with the wallet callback, then
+ * send it over RPC and wait for its result: a transaction the network does not accept, that fails on-chain or that is
+ * not confirmed in time throws a `TransactionError`
+ */
 export declare class AxisContractClient {
     constructor(params: ClientInitializationParams);
 
@@ -1079,7 +1083,13 @@ export declare function invertTicker(entry: TickerEntry): TickerEntry;
  */
 export declare function parseApiDate(value: string | number | undefined): number;
 
-/** Default allowance lifetime granted with a trade, in ledgers: ~180 days at 5s per ledger (the maximum entry TTL) */
+/**
+ * Longest allowance lifetime the client grants, in ledgers: ~180 days at 5s per ledger, one hour (720 ledgers) short of
+ * the network maximum entry TTL, since the token rejects a lifetime beyond the maximum of the ledger it applies in while
+ * the client counts from the ledger pushed by the AXIS API (3,109,680)
+ */
+export declare const MAX_APPROVAL_TTL_LEDGERS: number;
+/** Default allowance lifetime granted with a trade, in ledgers (`MAX_APPROVAL_TTL_LEDGERS`, ~180 days) */
 export declare const APPROVAL_TTL_LEDGERS: number;
 /** An allowance expiring within this number of ledgers is renewed with the next trade (~1 day) */
 export declare const APPROVAL_RENEW_LEDGERS: number;
@@ -1095,7 +1105,7 @@ export interface ApprovalPlanParams {
     ledger: number;
     /** Ledger the current allowance lives until (0 or omitted when unknown) */
     liveUntil?: number;
-    /** Lifetime of a new allowance in ledgers, `APPROVAL_TTL_LEDGERS` by default */
+    /** Lifetime of a new allowance in ledgers, `APPROVAL_TTL_LEDGERS` by default, at most `MAX_APPROVAL_TTL_LEDGERS` */
     ttl?: number;
 }
 
@@ -1106,6 +1116,27 @@ export interface ApprovalPlanParams {
  * @returns Approval to pass with the call, undefined when the current allowance already covers it
  */
 export declare function planApproval(params: ApprovalPlanParams): {amount: bigint, liveUntil: number} | undefined;
+
+export interface ReductionPlanParams {
+    /** Amount the open orders selling the asset still need after the call */
+    target: bigint;
+    /** Current allowance */
+    allowance: bigint;
+    /** Current ledger sequence */
+    ledger: number;
+    /** Ledger the current allowance lives until (0 or omitted when unknown) */
+    liveUntil?: number;
+    /** Lifetime of a renewed allowance in ledgers, `APPROVAL_TTL_LEDGERS` by default, at most `MAX_APPROVAL_TTL_LEDGERS` */
+    ttl?: number;
+}
+
+/**
+ * Decide whether the allowance can be lowered once the open orders selling the token need less of it (orders canceled
+ * or shrunk). A zero target revokes the allowance (`liveUntil` 0). A nonzero one keeps the current lifetime when it lasts
+ * more than `APPROVAL_RENEW_LEDGERS`, and renews it otherwise. An expired allowance is left alone
+ * @returns Approval to pass with the call, undefined when the allowance does not exceed the target
+ */
+export declare function planReduction(params: ReductionPlanParams): {amount: bigint, liveUntil: number} | undefined;
 
 /**
  * Max amount of `selling` tokens a buy trade may cost: `ceil(amount × price / 10^18)`
@@ -1529,18 +1560,24 @@ export type AccountMarketFilter = string | {base: string, quote: string} | strin
  * - `remove` {@link AccountOrder} - an order left the open orders (after `filled`, `cancel`, `expire`)
  * - `order` `{action, order, fill?}` - any order change
  * - `backing` `{asset, backing}` - the balance, allowance or the backing split of the orders selling a token changed
- * - `approve` `{asset, amount, liveUntil}` - a trading call is about to grant an allowance
+ * - `approve` `{asset, amount, liveUntil}` - a call is about to set an allowance (grant, renew, lower or revoke it)
  * - `trade` {ApiTrade} - the account performed a trade
  * - `swap` {ApiSwap} - the account performed a swap
  * - `change` - the open orders or the backing changed
  * - `error` `Error` - the push API rejected the account subscription
+ *
+ * Calls submitting transactions (`sell`, `buy`, `swap`, `update`, `cancel`, `cancelAll`, `revoke`, `crossfill`) run one
+ * at a time: each one builds its transaction and plans its approvals after the previous one settled.
  */
 export declare class AxisAccount extends Emitter {
     /** Trader address */
     readonly address: string;
     /** Wallet signing callback, required to trade */
     signTransaction?: SignTransactionCallback;
-    /** Lifetime of the allowances granted by trading calls, in ledgers (`APPROVAL_TTL_LEDGERS` by default) */
+    /**
+     * Lifetime of the allowances granted by trading calls, in ledgers (`APPROVAL_TTL_LEDGERS` by default, at most
+     * `MAX_APPROVAL_TTL_LEDGERS`)
+     */
     approvalTtl: number;
     /** Open orders by id */
     readonly orders: Map<string, AccountOrder>;
@@ -1602,17 +1639,27 @@ export declare class AxisAccount extends Emitter {
      */
     estimateBuy(params: AccountTradeParams): Promise<TradeEstimate>;
     /**
-     * Change the amount, price or expiration of open orders (omitted fields keep their current values)
+     * Change the amount, price or expiration of open orders (omitted fields keep their current values). The allowance of
+     * every sold token follows what its open orders need: raised when they grow, or when it does not back the changed
+     * orders, lowered when they shrink
      * @returns Updated order ids
      */
     update(updates: Array<{id: bigint | string, amount?: bigint, price?: bigint, expires?: number}>): Promise<bigint[]>;
-    /** Cancel open orders */
+    /** Cancel open orders, lowering the allowance of every sold token to what its remaining open orders need */
     cancel(ids: Array<bigint | string>): Promise<void>;
     /**
-     * Cancel all open orders
+     * Cancel all open orders, lowering the allowances like `cancel`
      * @returns Canceled order ids
      */
     cancelAll(filter?: {market?: AccountMarketFilter}): Promise<string[]>;
+    /**
+     * Set the allowances granted to the AXIS contract on tokens to zero, optionally canceling the open orders selling
+     * them in the same transactions. The revocation goes with the first transaction. Works while the contract is frozen
+     * @param assets - Token contract ids
+     * @param options - `cancelOrders`: also cancel every open order selling these tokens
+     * @throws The submission error, with the `revoked` tokens and the `canceled` order ids done before it
+     */
+    revoke(assets: string[], options?: {cancelOrders?: boolean}): Promise<AccountRevokeResult>;
     /**
      * Fill an open order against the book while keeping profits from price inefficiencies
      * @param takerOrderId - Order acting as the taker
@@ -1631,6 +1678,43 @@ export declare class AxisAccount extends Emitter {
     refresh(): Promise<void>;
     /** Stop tracking this account */
     close(): void;
+}
+
+/** Result of `AxisAccount.revoke` */
+export interface AccountRevokeResult {
+    /** Tokens whose allowance was set to zero */
+    revoked: string[];
+    /** Canceled order ids */
+    canceled: string[];
+}
+
+/**
+ * Error thrown when a submitted transaction is not accepted by the network, fails on-chain or is not confirmed in time
+ * (a plain `Error` with these properties)
+ */
+export interface TransactionError extends Error {
+    /**
+     * - `ERROR`: rejected with a result code (`result`)
+     * - `TRY_AGAIN_LATER`: not accepted for now, the network is congested or another transaction of the account is pending
+     * - `FAILED`: applied and failed on-chain
+     * - `TIMEOUT`: not seen before its time bounds expired, it can no longer be included
+     */
+    status: 'ERROR' | 'TRY_AGAIN_LATER' | 'FAILED' | 'TIMEOUT';
+    /** Transaction hash, hex */
+    hash: string;
+    /** Transaction result code, Horizon style (`tx_bad_seq`, `tx_insufficient_fee`, `tx_failed`...) */
+    result?: string;
+    /** Result code of the failed operation of `tx_failed` (`invoke_host_function_trapped`...) */
+    opResult?: string;
+    /**
+     * Contract error code the call failed with, when the RPC server returns the diagnostic events of the transaction:
+     * a DEX error (see `ContractErrors`), or a token error with `tokenError` set
+     */
+    code?: number;
+    /** The error was raised by a token transfer */
+    tokenError?: boolean;
+    /** Token contract that raised the error */
+    contract?: string;
 }
 
 /** Convert an API order to the client form (bigint amounts and prices, numeric timestamps) */
