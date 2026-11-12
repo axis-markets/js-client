@@ -248,9 +248,11 @@ export class AxisApiClient {
  * @typedef {{}} QuotePathStep
  * @property {string} selling - Selling asset contract id at this hop
  * @property {string} buying - Buying asset contract id at this hop
- * @property {string[]} orders - Maker order IDs matched at this hop
- * @property {string} [worstPrice] - Highest price among the matched orders (maker `buying` per `selling`, 18 decimals):
- * a trade limit at this price crosses every listed order
+ * @property {string[]} orders - Maker order IDs to pass to the contract: the orders the quote fills, followed on a
+ * direct route by spare orders the contract reaches only when it passes over one of them (at most 19 in all)
+ * @property {string} [worstPrice] - Highest price among the orders the quote fills (maker `buying` per `selling`, 18
+ * decimals): a trade limit at this price crosses them all. Spares are priced at or below it, except in a `maxPrice`
+ * crossing, where they reach up to `maxPrice`
  */
 
 /**
@@ -325,9 +327,22 @@ export class AxisApiClient {
 /**
  * @typedef {{}} ContractInfo - Contract state tracked by the indexer
  * @property {string} address - AXIS contract address
+ * @property {'mainnet'|'testnet'} [network] - Stellar network of the contract
  * @property {boolean} frozen - Whether trading is blocked by the safety admin
  * @property {ContractInfoConfig} [config] - Contract configuration
  * @property {ContractInfoMarket[]} markets - Markets opened by `subsidize`
+ * @property {ContractInfoAsset[]} [assets] - Metadata of the market tokens
+ */
+
+/**
+ * @typedef {{}} ContractInfoAsset - Market token metadata (only `contract` until the AXIS API resolves it)
+ * @property {string} contract - Token contract address
+ * @property {string} [code] - Asset code (token symbol)
+ * @property {string} [issuer] - Issuer account of a classic asset, `native` for XLM, absent for a SEP-41 token
+ * @property {number} [decimals] - Token decimals
+ * @property {string} [name] - Asset name
+ * @property {string} [domain] - Home domain of the issuer
+ * @property {string} [icon] - Icon URL
  */
 
 /**

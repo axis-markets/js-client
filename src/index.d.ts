@@ -533,9 +533,9 @@ export interface QuotePathStep {
     selling: string;
     /** Buying asset contract id at this hop */
     buying: string;
-    /** Maker order IDs matched at this hop */
+    /** Maker order IDs to pass to the contract: the orders the quote fills, followed on a direct route by spare orders the contract reaches only when it passes over one of them (at most 19 in all) */
     orders: string[];
-    /** Highest price among the matched orders (maker `buying` per `selling`, 18 decimals): a trade limit at this price crosses every listed order */
+    /** Highest price among the orders the quote fills (maker `buying` per `selling`, 18 decimals): a trade limit at this price crosses them all. Spares are priced at or below it, except in a `maxPrice` crossing, where they reach up to `maxPrice` */
     worstPrice?: string;
 }
 
@@ -687,16 +687,38 @@ export interface ContractInfoMarket {
     refreshed: string;
 }
 
+/** Market token metadata (only `contract` until the AXIS API resolves it) */
+export interface ContractInfoAsset {
+    /** Token contract address */
+    contract: string;
+    /** Asset code (token symbol) */
+    code?: string;
+    /** Issuer account of a classic asset, `native` for XLM, absent for a SEP-41 token */
+    issuer?: string;
+    /** Token decimals */
+    decimals?: number;
+    /** Asset name */
+    name?: string;
+    /** Home domain of the issuer */
+    domain?: string;
+    /** Icon URL */
+    icon?: string;
+}
+
 /** Contract state tracked by the indexer */
 export interface ContractInfo {
     /** AXIS contract address */
     address: string;
+    /** Stellar network of the contract */
+    network?: 'mainnet' | 'testnet';
     /** Whether trading is blocked by the safety admin */
     frozen: boolean;
     /** Contract configuration */
     config?: ContractInfoConfig;
     /** Markets opened by `subsidize` */
     markets: ContractInfoMarket[];
+    /** Metadata of the market tokens */
+    assets?: ContractInfoAsset[];
 }
 
 export interface OrdersParams {
