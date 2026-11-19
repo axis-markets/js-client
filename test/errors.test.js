@@ -20,8 +20,17 @@ const trapped = () => new xdr.TransactionResult({
     ext: xdr.TransactionResultExt.v0()
 })
 
-/** Diagnostic `error` event of a contract (none for an event the host emits outside a contract) */
-function errorEvent(code, contract) {
+const ORACLE = 'CDEIQLTE3Y3XQMYPSZFJC2OXIS67F4MURGP73NCE2C2NZZ22RNSPV7ZI'
+const FEE_TOKEN = 'CBULLEXCJPG2734I5V62IMZSCM3GOH3L55BHKNBIDRK2QIR5YH4SN6IJ'
+
+/**
+ * Diagnostic `error` event of a contract (none for an event the host emits outside a contract), with the call that
+ * failed (`fn`) when the caller reports it
+ */
+function errorEvent(code, contract, fn, caught = false) {
+    const data = fn ?
+        xdr.ScVal.scvVec([xdr.ScVal.scvString(`contract ${caught ? 'try_' : ''}call failed`), xdr.ScVal.scvSymbol(fn), xdr.ScVal.scvVec([])]) :
+        xdr.ScVal.scvVoid()
     return new xdr.DiagnosticEvent({
         inSuccessfulContractCall: false,
         event: new xdr.ContractEvent({
@@ -30,10 +39,27 @@ function errorEvent(code, contract) {
             type: xdr.ContractEventType.diagnostic,
             body: xdr.ContractEventBody.v0(new xdr.ContractEventV0({
                 topics: [xdr.ScVal.scvSymbol('error'), xdr.ScVal.scvError(xdr.ScError.sceContract(code))],
-                data: xdr.ScVal.scvVoid()
+                data
             }))
         })
     })
+}
+
+/** Simulation error with its event log, events given newest first as [contract, code, data] */
+function simulationLog(code, events) {
+    return 'HostError: Error(Contract, #' + code + ')\n\nEvent log (newest first):\n' +
+        events.map(([contract, eventCode, data], i) =>
+            `   ${i}: [Diagnostic Event] ${contract ? `contract:${contract}, ` : ''}topics:[error, Error(Contract, #${eventCode})], data:${data}\n`).join('')
+}
+
+/** Error thrown by processSimulationErrors */
+function simulationFailure(tx) {
+    try {
+        processSimulationErrors(tx)
+    } catch (e) {
+        return e
+    }
+    throw new Error('Simulation error expected')
 }
 
 describe('ContractErrors', () => {
@@ -88,9 +114,137 @@ describe('processSimulationErrors', () => {
             error = e
         }
         expect(error).toBeInstanceOf(Error)
-        expect(error).toMatchObject({code: 10, tokenError: true, contract: token})
+        expect(error).toMatchObject({code: 10, tokenError: true, contract: token, fn: 'transfer_from'})
         expect(error.message).toContain('BalanceError')
         expect(error.message).toContain('Either side')
+    })
+
+    test('reports an error of another contract with the contract and the function it failed in', () => {
+        //subsidize: the oracle rejects track
+        const error = simulationFailure({
+            options: {contractId: CONTRACT},
+            simulation: {
+                error: simulationLog(103, [
+                    [CONTRACT, 103, '"escalating error to VM trap from failed host function call: call"'],
+                    [CONTRACT, 103, `["contract call failed", track, [${TRADER}, ${CONTRACT}, [], 100]]`],
+                    [ORACLE, 103, '"failing with contract error"']
+                ])
+            }
+        })
+        expect(error.message).toBe(`Contract ${ORACLE} failed in track: #103`)
+        expect(error).toMatchObject({code: 103, contract: ORACLE, fn: 'track'})
+        expect(error.tokenError).toBeUndefined()
+    })
+
+    test('a failed token burn is not a transfer failure', () => {
+        //subsidize: the oracle burns the fee token of a sponsor without the balance
+        const error = simulationFailure({
+            options: {contractId: CONTRACT},
+            simulation: {
+                error: simulationLog(10, [
+                    [CONTRACT, 10, '"escalating error to VM trap from failed host function call: call"'],
+                    [CONTRACT, 10, `["contract call failed", track, [${TRADER}, ${CONTRACT}, [], 100]]`],
+                    [ORACLE, 10, '"escalating error to VM trap from failed host function call: call"'],
+                    [ORACLE, 10, `["contract call failed", burn, [${TRADER}, 100]]`],
+                    [FEE_TOKEN, 10, '"balance is not sufficient to spend"']
+                ])
+            }
+        })
+        expect(error.message).toBe(`Contract ${FEE_TOKEN} failed in burn: #10`)
+        expect(error).toMatchObject({code: 10, contract: FEE_TOKEN, fn: 'burn'})
+        expect(error.tokenError).toBeUndefined()
+    })
+
+    test('reads the event log the RPC server returns in events', () => {
+        //as simulated on Testnet: subsidize of a sponsor without a fee token trustline, the message has no log
+        const burn = simulationFailure({
+            options: {contractId: CONTRACT},
+            simulation: {
+                error: 'HostError: Error(Contract, #13)',
+                events: [errorEvent(13, FEE_TOKEN), errorEvent(13, ORACLE, 'burn'), errorEvent(13, ORACLE),
+                    errorEvent(13, CONTRACT, 'track'), errorEvent(13, CONTRACT)]
+            }
+        })
+        expect(burn.message).toBe(`Contract ${FEE_TOKEN} failed in burn: #13`)
+        expect(burn).toMatchObject({code: 13, contract: FEE_TOKEN, fn: 'burn'})
+        expect(burn.tokenError).toBeUndefined()
+        const transfer = simulationFailure({
+            options: {contractId: CONTRACT},
+            simulation: {
+                error: 'HostError: Error(Contract, #10)',
+                events: [errorEvent(10, TOKEN), errorEvent(10, CONTRACT, 'transfer'), errorEvent(10, CONTRACT)]
+            }
+        })
+        expect(transfer).toMatchObject({code: 10, tokenError: true, contract: TOKEN, fn: 'transfer'})
+    })
+
+    test('a transfer that fails in a contract the token calls is still a token error', () => {
+        //a token with a compliance module: the DEX called transfer_from, the module refused it
+        const events = [errorEvent(5, ORACLE), errorEvent(5, TOKEN, 'can_transfer'), errorEvent(5, TOKEN),
+            errorEvent(5, CONTRACT, 'transfer_from'), errorEvent(5, CONTRACT)]
+        const error = simulationFailure({options: {contractId: CONTRACT}, simulation: {error: 'HostError: Error(Contract, #5)', events}})
+        expect(error).toMatchObject({code: 5, tokenError: true, contract: TOKEN, fn: 'transfer_from'})
+        //the same call through a contract that invoked the DEX
+        const router = 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75'
+        const routed = transactionError('FAILED', {
+            events: [...events, errorEvent(5, router, 'trade'), errorEvent(5, router)],
+            contractId: CONTRACT
+        })
+        expect(routed).toMatchObject({code: 5, tokenError: true, contract: TOKEN, fn: 'transfer_from'})
+        //a transfer the oracle makes is not a settlement transfer
+        const charged = simulationFailure({
+            options: {contractId: CONTRACT},
+            simulation: {
+                error: 'HostError: Error(Contract, #10)',
+                events: [errorEvent(10, FEE_TOKEN), errorEvent(10, ORACLE, 'transfer'), errorEvent(10, ORACLE),
+                    errorEvent(10, CONTRACT, 'track'), errorEvent(10, CONTRACT)]
+            }
+        })
+        expect(charged).toMatchObject({code: 10, contract: FEE_TOKEN, fn: 'transfer'})
+        expect(charged.tokenError).toBeUndefined()
+    })
+
+    test('falls back to the event log of the message when events hold no error', () => {
+        const error = simulationFailure({
+            options: {contractId: CONTRACT},
+            simulation: {
+                error: simulationLog(10, [[CONTRACT, 10, '["contract call failed", transfer_from, []]'], [TOKEN, 10, '"balance"']]),
+                events: [new xdr.DiagnosticEvent({
+                    inSuccessfulContractCall: false,
+                    event: new xdr.ContractEvent({
+                        ext: xdr.ExtensionPoint.v0(),
+                        contractId: null,
+                        type: xdr.ContractEventType.diagnostic,
+                        body: xdr.ContractEventBody.v0(new xdr.ContractEventV0({topics: [xdr.ScVal.scvSymbol('fn_call')], data: xdr.ScVal.scvVoid()}))
+                    })
+                })]
+            }
+        })
+        expect(error).toMatchObject({code: 10, tokenError: true, contract: TOKEN, fn: 'transfer_from'})
+    })
+
+    test('a failure the contract caught ends the chain, even with the same code', () => {
+        const other = 'CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75'
+        const error = simulationFailure({
+            options: {contractId: CONTRACT},
+            simulation: {
+                error: simulationLog(10, [
+                    [CONTRACT, 10, `["contract call failed", transfer_from, [${TRADER}, ${TRADER}, 5]]`],
+                    [TOKEN, 10, '"balance"'],
+                    //a maker whose asset could not be collected, skipped earlier
+                    [CONTRACT, 10, `["contract try_call failed", transfer_from, [${TRADER}, ${CONTRACT}, 5]]`],
+                    [other, 10, '"balance"']
+                ])
+            }
+        })
+        expect(error).toMatchObject({code: 10, tokenError: true, contract: TOKEN, fn: 'transfer_from'})
+        //host events outside any contract name no contract
+        const dex = simulationFailure({
+            options: {contractId: CONTRACT},
+            simulation: {error: simulationLog(709, [[null, 709, '"escalating error to panic"'], [CONTRACT, 709, '"not filled"']])}
+        })
+        expect(dex.message).toBe('Contract execution error: #709 NotFilled')
+        expect(dex.contract).toBeUndefined()
     })
 
     test('a DEX error stays a contract error even when a caught token error preceded it', () => {
@@ -104,18 +258,29 @@ describe('processSimulationErrors', () => {
             }
         }
         expect(() => processSimulationErrors(tx)).toThrow('Contract execution error: #708 CannotReceive')
-        //without an event log, a code of the Stellar Asset Contract is a token error
-        const bare = {simulation: {error: 'HostError: Error(Contract, #9)'}}
-        expect(() => processSimulationErrors(bare)).toThrow(expect.objectContaining({code: 9, tokenError: true}))
+        //without an event log, a code the DEX does not define names nobody
+        const bare = simulationFailure({simulation: {error: 'HostError: Error(Contract, #9)'}})
+        expect(bare.message).toBe('Simulation failed: HostError: Error(Contract, #9)')
+        expect(bare.tokenError).toBeUndefined()
         const axis = {simulation: {error: 'HostError: Error(Contract, #712)'}}
         expect(() => processSimulationErrors(axis)).toThrow('Contract execution error: #712 IntermediaryCannotReceive')
     })
 
-    test('rethrows unknown simulation errors as-is', () => {
-        const tx = {simulation: {error: 'HostError: Error(WasmVm, InvalidAction)'}}
-        expect(() => processSimulationErrors(tx)).toThrow('HostError: Error(WasmVm, InvalidAction)')
-        const unknownCode = {simulation: {error: 'HostError: Error(Contract, #999)'}}
-        expect(() => processSimulationErrors(unknownCode)).toThrow('HostError: Error(Contract, #999)')
+    test('wraps other simulation errors, keeping the raw error in details', () => {
+        const raw = 'HostError: Error(WasmVm, InvalidAction)\n\nEvent log (newest first):\n   0: [Diagnostic Event] ...'
+        for (const [error, message] of [[raw, 'Simulation failed: HostError: Error(WasmVm, InvalidAction)'],
+            ['HostError: Error(Contract, #999)', 'Simulation failed: HostError: Error(Contract, #999)']]) {
+            let thrown
+            try {
+                processSimulationErrors({simulation: {error}})
+            } catch (e) {
+                thrown = e
+            }
+            expect(thrown).toBeInstanceOf(Error)
+            expect(thrown.message).toBe(message)
+            expect(thrown.details).toBe(error)
+            expect(thrown.code).toBeUndefined()
+        }
     })
 })
 
@@ -148,11 +313,24 @@ describe('transactionError', () => {
         const error = transactionError('FAILED', {
             result: trapped(),
             //a maker transfer caught earlier, then the token error the DEX re-raised
-            events: [errorEvent(11, TOKEN), errorEvent(10, TOKEN), errorEvent(10, CONTRACT)],
+            events: [errorEvent(11, TOKEN), errorEvent(11, CONTRACT, 'transfer_from', true), errorEvent(10, TOKEN),
+                errorEvent(10, CONTRACT, 'transfer_from'), errorEvent(10, CONTRACT)],
             contractId: CONTRACT
         })
-        expect(error).toMatchObject({code: 10, tokenError: true, contract: TOKEN})
+        expect(error).toMatchObject({code: 10, tokenError: true, contract: TOKEN, fn: 'transfer_from'})
         expect(error.message).toContain('BalanceError')
+    })
+
+    test('names another contract that failed on-chain', () => {
+        const error = transactionError('FAILED', {
+            hash: 'abc',
+            result: trapped(),
+            events: [errorEvent(103, ORACLE), errorEvent(103, CONTRACT, 'track'), errorEvent(103, CONTRACT), errorEvent(103)],
+            contractId: CONTRACT
+        })
+        expect(error).toMatchObject({status: 'FAILED', code: 103, contract: ORACLE, fn: 'track'})
+        expect(error.tokenError).toBeUndefined()
+        expect(error.message).toBe(`Transaction abc failed: tx_failed (invoke_host_function_trapped). Contract ${ORACLE} failed in track: #103`)
     })
 
     test('omits the code when the network kept no diagnostic events', () => {

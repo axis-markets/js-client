@@ -206,7 +206,7 @@ See [`src/index.d.ts`](src/index.d.ts) for the full typed API.
 | `cancel(trader, ids)` | Cancel existing orders, expired ones included (`trader` is the owner address; `ids` is a `bigint[]`, non-existent orders are ignored). Client sugar: the contract has no `cancel`, this calls `update` with a zero amount per id; up to 90 orders per call. |
 | `crossfill(trader, takerOrderId, orders)` | Fill an existing order against matching orders from the book; profits from price inefficiencies (the crossed spread) go to `trader`. Returns `Promise<[sold, bought, surplus]>`: the amount the taker order sold, the amount it received and the surplus paid to `trader`. |
 | `swap(params)` | Swap tokens across several markets along a route (`params: SwapArguments`); the contract holds the intermediate hop proceeds only within the call. Returns `Promise<[sold, bought]>`. |
-| `keepalive(days?)` | Extend the contract instance and code lifetime to `days` (30 by default, at most the network maximum)Days are converted into ledgers with the configured `Config.ledger_time` (5 seconds when it cannot be read). Anyone can send it, and it works while the contract is frozen. Other calls extend the contract only when less than 3 days are left.  Returns `Promise<number>`, the ledger both entries live until. |
+| `keepalive(days?)` | Extend the contract instance and code lifetime to `days` (30 by default, at most 179: the network rejects an extension to its full 180-day maximum). Days are converted into ledgers with the configured `Config.ledger_time` (5 seconds when it cannot be read). Anyone can send it, and it works while the contract is frozen. Other calls extend the contract only when less than 3 days are left.  Returns `Promise<number>`, the ledger both entries live until. |
 | `requote(selling, buying)` | Re-check both market assets against the price oracle and cache fresh prices for trading; the market record and the cache are rewritten only when they change. When the simulation writes nothing (the market and the cached prices are current, or the oracle has no newer price), no transaction is submitted and the simulated record is returned. Permissionless, blocked while frozen. Returns `Promise<Market \| undefined>` with the updated record (`undefined` for an unknown pair). |
 | `subsidize(params)` | Extend the oracle price feeds access of a market, creating the market if it does not exist yet, by burning exactly `amount` XRF from the sponsor (`params: SubsidizeArguments`). Returns `Promise<bigint[]>` with the new expiration timestamps. |
 
@@ -486,10 +486,16 @@ Typed as `TradeContractEvent`, `SwapContractEvent`, `OrderCreatedContractEvent`,
 ### Contract errors
 
 Simulation failures caused by the contract are thrown as `Error` with `message` `Contract execution error: #<code>
-<name>` and a numeric `code` property. A failure raised by a token the call invoked (a settlement transfer) is thrown as
-an `Error` with the token's `code`, `tokenError: true` and the token `contract`, named after `TokenErrors` (for example
-`#10 BalanceError`, which a payer without the balance and a recipient at its trustline limit both raise). Other
-simulation failures are rethrown as the raw RPC error string, not an `Error`.
+<name>` and a numeric `code` property. A failed token transfer (`transfer` or `transfer_from`, a settlement payment)
+is thrown as an `Error` with the token's `code`, `tokenError: true`, the token `contract` and the function `fn`, named
+after `TokenErrors` (for example `#10 BalanceError`, which a payer without the balance and a recipient at its trustline
+limit both raise). A transfer that fails in a contract the token calls (a compliance module) is reported the same way,
+with the token as `contract`. An error raised by any other contract the call reached (the oracle, or the XRF `burn` in
+`subsidize`) is thrown as `Contract <contract> failed in <fn>: #<code>` with that contract's `code`, its `contract`
+and the function `fn` it was called with: an `Error` with `contract` set never carries an AXIS code. The client finds
+where an error was raised in the diagnostic events of the simulation. Other simulation failures (host and
+authorization errors, unknown contract codes, a code the event log does not attribute) are thrown as an `Error` with
+`message` `Simulation failed: <first line of the RPC error>` and the full RPC error in `details`.
 
 The client signs with the wallet callback (wallet errors pass through as the SDK throws them), then sends the
 transaction over RPC and waits for its result. A submitted transaction that does not go through throws an `Error` with
@@ -499,7 +505,7 @@ the transaction `hash` and a `status`:
 |---|---|---|
 | `ERROR` | The network rejected it, nothing was charged. | `result`: the result code, Horizon style, for example `tx_bad_seq` (another transaction of the account went through first) or `tx_insufficient_fee`. A transaction the RPC server accepted but the network dropped because another transaction of the account used its sequence number is reported the same way. |
 | `TRY_AGAIN_LATER` | Not accepted for now: the network is congested, or another transaction of the account is pending. | |
-| `FAILED` | Applied and failed on-chain, the fee was charged. | `result` (`tx_failed`), `opResult` (for example `invoke_host_function_trapped`), and `code` (plus `tokenError` and `contract`) when the RPC server returns the diagnostic events of the transaction: a call that passed simulation can still fail when the book changes before it applies, for example `709` for a `FillOrKill` trade or a `swap`. |
+| `FAILED` | Applied and failed on-chain, the fee was charged. | `result` (`tx_failed`), `opResult` (for example `invoke_host_function_trapped`), and `code` (plus `contract` and `fn` for another contract, and `tokenError` for a token transfer) when the RPC server returns the diagnostic events of the transaction: a call that passed simulation can still fail when the book changes before it applies, for example `709` for a `FillOrKill` trade or a `swap`. |
 | `TIMEOUT` | Not seen before its time bounds expired, it can no longer be included. | |
 
 When the RPC server cannot be reached at submission, the client looks the transaction up for a few seconds before

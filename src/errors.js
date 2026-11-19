@@ -44,13 +44,38 @@ export const TokenErrors = {
 }
 
 /**
+ * Token functions whose failure is a failed transfer, which either side may have caused
+ */
+const TRANSFER_FUNCTIONS = new Set(['transfer', 'transfer_from'])
+
+/**
+ * Diagnostic `error` event of a contract error
+ * @typedef {object} ErrorEvent
+ * @property {number} code - Contract error code
+ * @property {string} [contract] - Contract that emitted the event, absent for the host outside any contract
+ * @property {string} [fn] - Function of the contract whose call failed, on the event its caller emits for the failure
+ * @property {boolean} [caught] - The caller caught that failure (`try_call`)
+ * @private
+ */
+
+/**
+ * Contract call an error failed on its way up
+ * @typedef {object} ErrorFrame
+ * @property {string} [contract] - Contract address, when the event log names it
+ * @property {string} [fn] - Function its caller called it with, absent for the invoked contract itself
+ * @private
+ */
+
+/**
  * Handle simulation errors if any. A contract error raised by the DEX contract is mapped by its code. An error raised by
- * another contract the call invoked (the token whose transfer failed) is reported with `tokenError` set: a failed
- * payment to a maker fails the whole call with the token's own error, and the contract does not tell whether the payer
- * could not pay or the maker could not be credited (e.g. a full trustline), so neither side is assumed
+ * a token transfer the call made is reported with `tokenError` set: a failed payment to a maker fails the whole call
+ * with the token's own error, and the contract does not tell whether the payer could not pay or the maker could not be
+ * credited (e.g. a full trustline), so neither side is assumed. An error raised by any other contract (the oracle, a
+ * token burn) is reported with the `contract` and the `fn` it failed in
  * @param {contract.AssembledTransaction} tx
- * @throws {Error} - Error with numeric `code` property for known contract errors, plus `tokenError` and `contract`
- *   for errors raised by a token
+ * @throws {Error} - Error with numeric `code` property for known contract errors, plus `contract` and `fn` for errors
+ *   raised by another contract, and `tokenError` for a failed token transfer; any other failure as an Error with the
+ *   raw simulation error in `details`
  * @internal
  */
 export function processSimulationErrors(tx) {
@@ -59,61 +84,123 @@ export function processSimulationErrors(tx) {
         const contractErrorMatch = /HostError: Error\(Contract, #(\d+)\)/.exec(message)
         if (contractErrorMatch) {
             const code = parseInt(contractErrorMatch[1], 10)
-            const error = contractError(code, findErrorSource(message, code)?.contract, tx.options?.contractId)
+            //RPC servers return the event log in `events`, older ones appended it to the error message
+            let events = diagnosticErrorEvents(tx.simulation.events ?? [])
+            if (!events.length) {
+                events = parseErrorEvents(message)
+            }
+            const error = contractError(code, findErrorChain(events, code), tx.options?.contractId)
             if (error)
                 throw error
         }
-        throw message
+        throw simulationError(message)
     }
 }
 
 /**
- * Wrapped aggregated error - token error when another contract than the DEX raised it, a DEX contract error otherwise
- * @param {number} code - Contract error code
- * @param {string} [source] - Contract that raised the error, when known
- * @param {string} [dexContract] - DEX contract address, when known
- * @return {Error|null} - Null for an unknown code of the DEX
+ * Simulation failure without a known contract error (a host or authorization error, an unknown contract code)
+ * @param {string} message - Raw simulation error, followed by its diagnostic event log
+ * @return {Error} - Error named after the first line of the raw error, which it keeps in `details`
  * @private
  */
-function contractError(code, source, dexContract) {
-    const raisedByToken = source && dexContract ? source !== dexContract : !ContractErrors[code] && !!TokenErrors[code]
-    if (raisedByToken)
-        return tokenError(code, source)
-    const err = ContractErrors[code]
-    if (!err)
-        return null
-    const error = new Error(`Contract execution error: #${code} ${err.message}`)
-    error.code = code
+function simulationError(message) {
+    const error = new Error(`Simulation failed: ${String(message).split('\n', 1)[0].trim()}`)
+    error.details = message
     return error
 }
 
 /**
- * Locate the contract that raised the error in a simulation event log. The log lists events newest first and an error
- * is re-emitted by every frame it fails, so the oldest `error` event with the code is where it was raised (errors of
- * caught calls carry other codes)
- * @param {string} message - Simulation error with its diagnostic event log
- * @param {number} code - Error code the simulation failed with
- * @return {{contract: string}|null}
+ * Wrapped aggregated error: a DEX contract error when the DEX raised it, a token error when a token transfer the DEX
+ * made failed (in the token or in a contract the token called), an error of another contract otherwise
+ * @param {number} code - Contract error code
+ * @param {ErrorFrame[]} chain - Calls the error failed, from the invoked contract down to the one that raised it
+ * @param {string} [dexContract] - DEX contract address, when known
+ * @return {Error|null} - Null for an unknown code of the DEX, or an error of another contract the log does not name
  * @private
  */
-function findErrorSource(message, code) {
-    let source = null
-    for (const match of message.matchAll(/contract:(C[A-Z2-7]{55}),\s*topics:\[error, Error\(Contract, #(\d+)\)/g)) {
-        if (parseInt(match[2], 10) === code) {
-            source = {contract: match[1]}
+function contractError(code, chain, dexContract) {
+    const {contract, fn} = chain[chain.length - 1]
+    //only the invoked contract runs without a caller: contracts cannot be re-entered
+    const raisedByDex = contract && dexContract ? contract === dexContract : !fn
+    if (raisedByDex) {
+        const err = ContractErrors[code]
+        if (!err)
+            return null
+        const error = new Error(`Contract execution error: #${code} ${err.message}`)
+        error.code = code
+        return error
+    }
+    //the call the DEX made tells a settlement transfer, whatever the token called in turn
+    const dexFrame = dexContract ? chain.findIndex(frame => frame.contract === dexContract) : -1
+    const call = chain[Math.max(dexFrame, 0) + 1]
+    if (TRANSFER_FUNCTIONS.has(call?.fn))
+        return tokenError(code, call.contract, call.fn)
+    if (!contract)
+        return null
+    const error = new Error(`Contract ${contract} failed${fn ? ` in ${fn}` : ''}: #${code}`)
+    error.code = code
+    error.contract = contract
+    if (fn) {
+        error.fn = fn
+    }
+    return error
+}
+
+/**
+ * Calls the error failed on its way up. Every frame the error fails re-emits it, and a failed contract call makes the
+ * caller emit an event naming the function it called, which starts the frame of the contract that emitted the older
+ * events. The last frame raised the error. A failure its caller caught (`try_call`), or an older event of another
+ * contract with no failed call between, ends the chain: errors of caught calls normally carry other codes
+ * @param {ErrorEvent[]} events - Error events, newest first
+ * @param {number} code - Error code the call failed with
+ * @return {ErrorFrame[]} - From the invoked contract down, never empty
+ * @private
+ */
+function findErrorChain(events, code) {
+    const chain = [{}]
+    for (const event of events) {
+        if (event.code !== code)
+            continue
+        if (event.caught)
+            break
+        const frame = chain[chain.length - 1]
+        if (frame.contract && event.contract && event.contract !== frame.contract)
+            break
+        frame.contract ??= event.contract
+        if (event.fn) {
+            chain.push({fn: event.fn})
         }
     }
-    return source
+    return chain
+}
+
+/**
+ * Contract error events of a simulation error message with the event log appended
+ * @param {string} message - Simulation error with its diagnostic event log (newest first)
+ * @return {ErrorEvent[]} - Newest first
+ * @private
+ */
+function parseErrorEvents(message) {
+    const events = []
+    for (const line of message.split('\n')) {
+        const match = /\[[^\]]*Event[^\]]*\]\s*(?:contract:(C[A-Z2-7]{55}),\s*)?topics:\[error, Error\(Contract, #(\d+)\)\](?:,\s*data:(.*))?/.exec(line)
+        if (!match)
+            continue
+        const call = /^\["contract (try_)?call failed", (\w+)/.exec(match[3] ?? '')
+        events.push({code: parseInt(match[2], 10), contract: match[1], fn: call?.[2], caught: !!call?.[1]})
+    }
+    return events
 }
 
 /**
  * Error raised by a token transfer during settlement
- * @param {number} code - Token error code
+ * @param {number} code - Error code of the token, or of a contract its transfer called
  * @param {string} [contract] - Token contract address, when the event log names it
+ * @param {string} fn - Transfer function that failed
  * @return {Error}
  * @private
  */
-function tokenError(code, contract) {
+function tokenError(code, contract, fn) {
     const name = TokenErrors[code]?.message || 'token error'
     const error = new Error(`Token transfer failed: #${code} ${name}${contract ? ` (token ${contract})` : ''}. ` +
         `Either side of the transfer may be at fault: the payer's balance or allowance, or the recipient's trustline ` +
@@ -123,6 +210,7 @@ function tokenError(code, contract) {
     if (contract) {
         error.contract = contract
     }
+    error.fn = fn
     return error
 }
 
@@ -135,15 +223,16 @@ function tokenError(code, contract) {
  * Transaction hash, its result (or its result code, when known without the result), the diagnostic events of a failed
  * call and the DEX contract address
  * @return {Error} - Error with `status`, `hash`, `result` (Horizon-style transaction result code, e.g. `tx_bad_seq`),
- * `opResult` (operation result code of `tx_failed`, e.g. `invoke_host_function_trapped`), and `code` (plus `tokenError`
- * and `contract` for a token) when the diagnostic events name the contract error the call failed with
+ * `opResult` (operation result code of `tx_failed`, e.g. `invoke_host_function_trapped`), and `code` (plus `contract`
+ * and `fn` for another contract, and `tokenError` for a token transfer) when the diagnostic events name the contract
+ * error the call failed with
  * @internal
  */
 export function transactionError(status, {hash, result, resultCode: knownCode, events, contractId} = {}) {
     const resultCode = knownCode ?? (result?.result?.type ? snakeCase(result.result.type) : undefined)
     const opResult = operationResultCode(result)
     const cause = events?.length ? findEventError(events) : undefined
-    const causeError = cause ? contractError(cause.code, cause.contract, contractId) : null
+    const causeError = cause ? contractError(cause.code, cause.chain, contractId) : null
     let message
     switch (status) {
         case 'ERROR':
@@ -171,11 +260,9 @@ export function transactionError(status, {hash, result, resultCode: knownCode, e
         error.opResult = opResult
     }
     if (causeError) {
-        error.code = causeError.code
-        if (causeError.tokenError) {
-            error.tokenError = true
-            if (causeError.contract) {
-                error.contract = causeError.contract
+        for (const key of ['code', 'tokenError', 'contract', 'fn']) {
+            if (causeError[key] !== undefined) {
+                error[key] = causeError[key]
             }
         }
     }
@@ -202,34 +289,45 @@ function operationResultCode(result) {
 
 /**
  * Contract error a failed call raised, from its diagnostic events (oldest first). An error is re-emitted by every frame
- * it fails, so the last error event carries the code the call failed with and the oldest event with that code names the
- * contract that raised it
+ * it fails, so the last error event carries the code the call failed with
  * @param {xdr.DiagnosticEvent[]} events
- * @return {{code: number, contract?: string}|undefined}
+ * @return {{code: number, chain: ErrorFrame[]}|undefined}
  * @private
  */
 function findEventError(events) {
-    const errors = []
-    for (const event of events) {
-        const code = eventErrorCode(event)
-        if (code !== undefined) {
-            errors.push({code, contract: eventContract(event)})
-        }
-    }
+    const errors = diagnosticErrorEvents(events)
     if (!errors.length)
         return undefined
-    const {code} = errors[errors.length - 1]
-    return {code, contract: errors.find(error => error.code === code && error.contract)?.contract}
+    const {code} = errors[0]
+    return {code, chain: findErrorChain(errors, code)}
 }
 
 /**
- * Contract error code of an `error` diagnostic event
- * @param {xdr.DiagnosticEvent} event
- * @return {number|undefined}
+ * Contract error events among diagnostic events
+ * @param {xdr.DiagnosticEvent[]} events - Oldest first
+ * @return {ErrorEvent[]} - Newest first
  * @private
  */
-function eventErrorCode(event) {
-    const topics = event?.event?.body?.value?.topics
+function diagnosticErrorEvents(events) {
+    const errors = []
+    for (const event of events) {
+        const error = errorEvent(event)
+        if (error) {
+            errors.unshift(error)
+        }
+    }
+    return errors
+}
+
+/**
+ * Contract error of an `error` diagnostic event
+ * @param {xdr.DiagnosticEvent} event
+ * @return {ErrorEvent|undefined}
+ * @private
+ */
+function errorEvent(event) {
+    const body = event?.event?.body?.value
+    const topics = body?.topics
     if (!topics || topics.length < 2)
         return undefined
     const [name, value] = topics
@@ -237,7 +335,15 @@ function eventErrorCode(event) {
         return undefined
     if (value.type !== 'scvError' || value.error.type !== 'sceContract')
         return undefined
-    return value.error.contractCode
+    const error = {code: value.error.contractCode, contract: eventContract(event)}
+    //the caller of a failed contract call reports it as ["contract call failed", fn, args]
+    const [message, fn] = body.data?.type === 'scvVec' ? body.data.vec ?? [] : []
+    const call = message?.type === 'scvString' && /^contract (try_)?call failed$/.exec(message.str.toString())
+    if (call && fn?.type === 'scvSymbol') {
+        error.fn = fn.sym.toString()
+        error.caught = !!call[1]
+    }
+    return error
 }
 
 /**

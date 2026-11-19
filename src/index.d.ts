@@ -470,7 +470,7 @@ export declare class AxisContractClient {
     /**
      * Extend the contract instance and code lifetime with an `ExtendFootprintTTL` operation, restoring the archived
      * ones first with a `RestoreFootprint` transaction.
-     * @param days - Lifetime in days, 30 by default, at most the network maximum (180 days on mainnet)
+     * @param days - Lifetime in days, 30 by default, at most 179 (the network rejects an extension to its full maximum, 180 days on mainnet)
      * @returns Ledger sequence both entries live at least until
      * @throws If `days` is invalid, if the instance is not found, if a simulation or a transaction fails
      */
